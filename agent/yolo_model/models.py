@@ -1,0 +1,61 @@
+
+from ultralytics import YOLO
+from typing import Optional
+from typing import Any, Callable, Dict
+
+
+
+# Type aliases for clarity
+Model = Any
+ModelLoader = Callable[[str], Optional[Model]]  # receives the requested model id/name
+
+# Internal registry mapping a simple name to a loader function
+_MODEL_REGISTRY: Dict[str, ModelLoader] = {}
+
+
+def register_model(name: str) -> Callable[[ModelLoader], ModelLoader]:
+    """
+    Register a model loader under a simple name.
+
+    Example:
+        @register_model("yolov8n")
+        def load_v8n(_name: str):
+            return YOLO("yolov8n.pt")
+    """
+    def decorator(func: ModelLoader) -> ModelLoader:
+        _MODEL_REGISTRY[name.lower()] = func
+        return func
+
+    return decorator
+
+
+
+@register_model("yolov8m.pt")
+def _yolov8m_loader(_name: str) -> Optional[Model]:
+    if YOLO is None:
+        print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
+        return None
+    return YOLO("yolov8m.pt")
+
+
+@register_model("yolov8n.pt")
+def _yolov8n_loader(_name: str) -> Optional[Model]:
+    if YOLO is None:
+        print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
+        return None
+    return YOLO("yolov8n.pt")
+
+
+@register_model("yolov8s.pt")
+def _yolov8s_loader(_name: str) -> Optional[Model]:
+    if YOLO is None:
+        print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
+        return None
+    return YOLO("yolov8s.pt")
+
+@register_model("yolov8m-pose.pt")
+def _yolov8m_pose_loader(_name: str) -> Optional[Model]:
+    if YOLO is None:
+        print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
+        return None
+    return YOLO("yolov8m-pose.pt")    

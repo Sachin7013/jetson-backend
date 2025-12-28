@@ -1,0 +1,10 @@
+.cursor
+.vscode
+.env
+.env.local
+venv
+*.md
+*.pt
+.__pycache__
+*.pyc
+video
