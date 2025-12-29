@@ -18,6 +18,11 @@ if __package__ is None or __package__ == "":
 
 from agent.rule_engine.registry import rules_registry
 
+# Import rule types so that their @register_rule decorators run and
+# populate the global rules_registry. These imports are used only for
+# their side effects.
+from agent.rule_engine import rule_types  # noqa: F401
+
 
 def evaluate_rules(rules: List[Dict[str, Any]], detections: Dict[str, Any], task: Dict[str, Any], state: Dict[int, Dict[str, Any]], now: datetime) -> Optional[Dict[str, Any]]:
     """
@@ -32,8 +37,13 @@ def evaluate_rules(rules: List[Dict[str, Any]], detections: Dict[str, Any], task
     Returns:
       dict {'label': str, 'rule_index': int} or None
     """
+    # Print all registered rule types before evaluating
+    print(f"[evaluate_rules] Registered rules: {list(rules_registry.keys())}")
+    print(f"[evaluate_rules] rules: {rules}")
     for rule_index, rule in enumerate(rules or []):
+        print(f"[evaluate_rules] rule: {rule}")
         rule_type = (rule.get("type") or "").strip().lower()
+        print(f"[evaluate_rules] rule_type: {rule_type}")
         handler = rules_registry.get(rule_type)
         if handler is None:
             continue

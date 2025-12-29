@@ -268,6 +268,13 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                     "ts": datetime.now(timezone.utc),
                 }
                 
+                # Debug: Log keypoint extraction (first frame and every 30 frames)
+                if frame_index == 1 or frame_index % 30 == 0:
+                    if merged_keypoints:
+                        print(f"[worker {task_id}] ✅ Keypoints extracted: {len(merged_keypoints)} person(s) with pose data")
+                    else:
+                        print(f"[worker {task_id}] ⚠️ No keypoints extracted! Check if model is a pose model (e.g., yolov8n-pose.pt)")
+                
                 # Draw bounding boxes and publish processed frame for agent stream
                 if shared_store is not None and loaded_rules:
                     try:
@@ -323,7 +330,13 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
 
                 if event and event.get("label"):
                     event_label = str(event["label"]).strip()
-                    print(f"[worker {task_id}] 🔔 {event_label} | agent='{agent_name}' | video_time={video_ts}")
+                    # Make fall detection alerts more prominent
+                    if "fall" in event_label.lower() or "accident" in event_label.lower():
+                        print(f"[worker {task_id}] 🚨🚨🚨 FALL DETECTED! {event_label} 🚨🚨🚨 | agent='{agent_name}' | video_time={video_ts}")
+                        if event.get("fallen_count"):
+                            print(f"[worker {task_id}]    └─ {event.get('fallen_count')} person(s) detected as fallen")
+                    else:
+                        print(f"[worker {task_id}] 🔔 {event_label} | agent='{agent_name}' | video_time={video_ts}")
                 else:
                     print(f"[worker {task_id}] ℹ️ No rule match | agent='{agent_name}' | video_time={video_ts}")
 

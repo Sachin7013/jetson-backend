@@ -53,9 +53,17 @@ def _yolov8s_loader(_name: str) -> Optional[Model]:
         return None
     return YOLO("yolov8s.pt")
 
-@register_model("yolov8m-pose.pt")
-def _yolov8m_pose_loader(_name: str) -> Optional[Model]:
+@register_model("yolov8n-pose.pt")
+def _yolov8n_pose_loader(_name: str) -> Optional[Model]:
     if YOLO is None:
         print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
         return None
-    return YOLO("yolov8m-pose.pt")    
+    return YOLO("yolov8n-pose.pt")  
+
+
+@register_model("yolov8s-pose.pt")
+def _yolov8s_pose_loader(_name: str) -> Optional[Model]:
+    if YOLO is None:
+        print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
+        return None
+    return YOLO("yolov8s-pose.pt")      
