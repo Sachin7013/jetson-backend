@@ -311,4 +311,3 @@ class AgentAWSSignalingClient:
                 await self.pc.close()
             except Exception:
                 pass
-

@@ -122,7 +122,6 @@ class StreamingService:
         
         Args:
             user_id: User ID
-            camera_id: Camera ID
             agent_id: Agent ID
         """
         key = f"{user_id}:{camera_id}:{agent_id}"
@@ -140,7 +139,7 @@ class StreamingService:
         
         print(f"[streaming] 🎯 Started AWS stream for agent: {agent_id} (user: {user_id})")
     
-    async def stop_agent_stream(self, user_id: str,camera_id:str, agent_id: str) -> None:
+    async def stop_agent_stream(self, user_id: str, camera_id: str, agent_id: str) -> None:
         """Stop streaming for a specific agent."""
         key = f"{user_id}:{camera_id}:{agent_id}"
         
@@ -159,4 +158,3 @@ class StreamingService:
     def get_active_agent_connections(self) -> int:
         """Get number of active agent streams."""
         return len(self._agent_clients)
-
