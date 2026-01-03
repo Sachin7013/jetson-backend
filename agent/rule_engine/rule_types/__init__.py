@@ -13,4 +13,5 @@ from agent.rule_engine.rule_types import accident_presence  # noqa: F401
 from agent.rule_engine.rule_types import class_presence  # noqa: F401
 from agent.rule_engine.rule_types import count_at_least  # noqa: F401
 from agent.rule_engine.rule_types import class_count  # noqa: F401
+from agent.rule_engine.rule_types import weapon_detection  # noqa: F401
 

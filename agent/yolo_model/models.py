@@ -66,4 +66,15 @@ def _yolov8s_pose_loader(_name: str) -> Optional[Model]:
     if YOLO is None:
         print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
         return None
-    return YOLO("yolov8s-pose.pt")      
+    return YOLO("yolov8s-pose.pt")     
+
+@register_model("yolov8-weapon-detection.pt")
+def _yolov8_weapon_detection(_name: str) -> Optional[Model]:
+    if YOLO is None:
+        print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
+        return None
+    # Load the trained weapon detection model (guns and knives)
+    trained_model_path = r"C:\Model training\runs\detect\guns-knives-detection\weights\best.pt"
+    print(f"==================================================Loading weapon detection model from {trained_model_path}==================================================")
+    return YOLO(trained_model_path)
+

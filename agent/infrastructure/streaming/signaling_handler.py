@@ -112,6 +112,7 @@ class SignalingHandler:
             
             # Create video track from shared_store
             track = SharedStoreVideoTrack(camera_id, self.shared_store)
+            # 🎥 Adds the video track to the WebRTC peer connection
             pc.addTrack(track)
             
             print(f"[streaming] 🎥 WebRTC connection established for camera: {camera_id}")

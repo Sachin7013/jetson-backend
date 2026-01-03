@@ -35,11 +35,10 @@ from agent.utils.utils import iso_now, parse_iso
 from agent.yolo_model.yolo_utils import init_yolo_model, check_event_match
 from agent.rule_engine.engine import evaluate_rules
 from agent.worker.video_io import open_video_capture
-from agent.worker.detections import extract_detections_from_result
-from agent.worker.detections import extract_keypoints_from_result
+from agent.worker.detections import extract_all_detections
 from agent.worker.frame_hub import reconstruct_frame
-from agent.worker.frame_processor import draw_bounding_boxes
-from agent.worker.frame_processor import draw_pose_keypoints
+from agent.worker.frame_processor import draw_detections_unified
+from agent.worker.model_capabilities import detect_model_capabilities, get_models_needed_by_rules
 import numpy as np
 
 
@@ -120,12 +119,17 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
 
     print(f"[worker {task_id}] ▶️ Starting '{agent_name}' | mode={run_mode} fps={fps} models={model_ids}")
 
-    # Load models
+    # Load models and detect their capabilities
     models = []
+    model_capabilities = []
     for model_id in model_ids:
         model_instance = init_yolo_model({"yolo_model_path": model_id})
         if model_instance is not None:
             models.append(model_instance)
+            # Detect what this model can do
+            capabilities = detect_model_capabilities(model_instance, model_id)
+            model_capabilities.append(capabilities)
+            print(f"[worker {task_id}] ✅ Model loaded: {model_id} | type={capabilities['detection_type']} | keypoints={capabilities['has_keypoints']}")
         else:
             print(f"[worker {task_id}] ⚠️ Failed to load model: {model_id}")
     if not models:
@@ -153,6 +157,30 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
 
     # Load rules ONCE at startup (do not refetch per frame)
     loaded_rules: List[Dict[str, any]] = task.get("rules") or []
+
+    # Optimize: Determine which models are actually needed based on rules
+    # This saves computation by only processing relevant models
+    needed_model_capabilities = get_models_needed_by_rules(loaded_rules, model_capabilities)
+    
+    # Create a set of model IDs that are needed (for fast lookup)
+    needed_model_ids = {cap.get("model_id", "") for cap in needed_model_capabilities}
+    
+    # Create a list of model indices to process
+    # We'll only process models whose capabilities are in the needed list
+    model_indices_to_process = []
+    for idx, cap in enumerate(model_capabilities):
+        model_id = cap.get("model_id", "")
+        # Check if this model's capability is in the needed list by comparing model_id
+        if model_id in needed_model_ids:
+            model_indices_to_process.append(idx)
+    
+    # If no models selected, process all (safety fallback)
+    if not model_indices_to_process:
+        model_indices_to_process = list(range(len(models)))
+        print(f"[worker {task_id}] ℹ️ All models will be processed (no filtering)")
+    else:
+        needed_names = [model_ids[i] for i in model_indices_to_process if i < len(model_ids)]
+        print(f"[worker {task_id}] ⚡ Optimized: Processing {len(model_indices_to_process)}/{len(models)} models based on rules: {needed_names}")
 
     try:
         # per-agent in-memory rule state (indexed by rule index)
@@ -237,27 +265,42 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                     skipped_in_window = 0
                     last_status = time.time()
 
-                # Run YOLO on this frame for each model, merge detections
+                # Run YOLO on this frame for each model, merge detections using unified extraction
                 merged_boxes: List[List[float]] = []
                 merged_classes: List[str] = []
                 merged_scores: List[float] = []
                 merged_keypoints: List[List[List[float]]] = []
                 
-                for model in models:
+                # Process only models that are needed by the rules (optimization)
+                for model_idx in model_indices_to_process:
+                    if model_idx >= len(models):
+                        continue
+                    
+                    model = models[model_idx]
                     try:
                         results = model(frame, verbose=False)
                     except Exception as exc:  # noqa: BLE001
                         print(f"[worker {task_id}] ⚠️ YOLO error: {exc}")
                         continue
+                    
                     if results:
                         first_result = results[0]
-                        boxes, classes, scores = extract_detections_from_result(first_result)
-                        merged_boxes.extend(boxes)
-                        merged_classes.extend(classes)
-                        merged_scores.extend(scores)
-                        keypoints = extract_keypoints_from_result(first_result)
-                        if keypoints:
-                            merged_keypoints.extend(keypoints)
+                        # Get model ID for this model
+                        model_id = model_ids[model_idx] if model_idx < len(model_ids) else ""
+                        
+                        # Use unified extraction (handles all model types)
+                        # For weapon models, normalize class names to lowercase
+                        normalize = "weapon" in model_id.lower()
+                        model_detections = extract_all_detections(first_result, model_id=model_id, normalize_classes=normalize)
+                        
+                        # Merge into combined detections
+                        merged_boxes.extend(model_detections.get("boxes", []))
+                        merged_classes.extend(model_detections.get("classes", []))
+                        merged_scores.extend(model_detections.get("scores", []))
+                        
+                        # Merge keypoints if available
+                        if model_detections.get("has_keypoints", False):
+                            merged_keypoints.extend(model_detections.get("keypoints", []))
 
                 # Build detections payload for rule engine
                 detections = {
@@ -275,14 +318,11 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                     else:
                         print(f"[worker {task_id}] ⚠️ No keypoints extracted! Check if model is a pose model (e.g., yolov8n-pose.pt)")
                 
-                # Draw bounding boxes and publish processed frame for agent stream
+                # Draw detections using unified pipeline (replaces old rule-specific methods)
                 if shared_store is not None and loaded_rules:
                     try:
-                        # Draw pose keypoints if available; otherwise draw bounding boxes
-                        if detections.get("keypoints"):
-                            processed_frame = draw_pose_keypoints(frame.copy(), detections, loaded_rules)
-                        else:
-                            processed_frame = draw_bounding_boxes(frame.copy(), detections, loaded_rules)
+                        # Use unified drawing function (handles all rule types automatically)
+                        processed_frame = draw_detections_unified(frame.copy(), detections, loaded_rules)
                         
                         # Get agent_id from task (use agent_id if available, else use task_id)
                         agent_id = task.get("agent_id") or task_id
@@ -330,8 +370,14 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
 
                 if event and event.get("label"):
                     event_label = str(event["label"]).strip()
+                    # Make weapon detection alerts more prominent
+                    if any(keyword in event_label.lower() for keyword in ["gun detected", "knife detected", "weapon detected"]):
+                        weapon_label = event_label.upper()
+                        print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 20} WEAPON DETECTED {'=' * 20}")
+                        print(f"[worker {task_id}] 🚨🚨🚨 {weapon_label} 🚨🚨🚨 | agent='{agent_name}' | video_time={video_ts}")
+                        print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 60}")
                     # Make fall detection alerts more prominent
-                    if "fall" in event_label.lower() or "accident" in event_label.lower():
+                    elif "fall" in event_label.lower() or "accident" in event_label.lower():
                         print(f"[worker {task_id}] 🚨🚨🚨 FALL DETECTED! {event_label} 🚨🚨🚨 | agent='{agent_name}' | video_time={video_ts}")
                         if event.get("fallen_count"):
                             print(f"[worker {task_id}]    └─ {event.get('fallen_count')} person(s) detected as fallen")
@@ -429,21 +475,35 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                     merged_scores: List[float] = []
                     merged_keypoints: List[List[List[float]]] = []
                     
-                    for model in models:
+                    # Process only models that are needed by the rules (patrol mode - optimization)
+                    for model_idx in model_indices_to_process:
+                        if model_idx >= len(models):
+                            continue
+                        
+                        model = models[model_idx]
                         try:
                             results = model(frame, verbose=False)
                         except Exception as exc:  # noqa: BLE001
                             print(f"[worker {task_id}] ⚠️ YOLO error: {exc}")
                             continue
+                        
                         if results:
                             first_result = results[0]
-                            boxes, classes, scores = extract_detections_from_result(first_result)
-                            merged_boxes.extend(boxes)
-                            merged_classes.extend(classes)
-                            merged_scores.extend(scores)
-                            keypoints = extract_keypoints_from_result(first_result)
-                            if keypoints:
-                                merged_keypoints.extend(keypoints)
+                            # Get model ID for this model
+                            model_id = model_ids[model_idx] if model_idx < len(model_ids) else ""
+                            
+                            # Use unified extraction (handles all model types)
+                            normalize = "weapon" in model_id.lower()
+                            model_detections = extract_all_detections(first_result, model_id=model_id, normalize_classes=normalize)
+                            
+                            # Merge into combined detections
+                            merged_boxes.extend(model_detections.get("boxes", []))
+                            merged_classes.extend(model_detections.get("classes", []))
+                            merged_scores.extend(model_detections.get("scores", []))
+                            
+                            # Merge keypoints if available
+                            if model_detections.get("has_keypoints", False):
+                                merged_keypoints.extend(model_detections.get("keypoints", []))
 
                     detections = {
                         "classes": merged_classes,
@@ -453,14 +513,11 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                         "ts": datetime.now(timezone.utc),
                     }
                     
-                    # Draw bounding boxes and publish processed frame for agent stream (patrol mode)
+                    # Draw detections using unified pipeline (patrol mode)
                     if shared_store is not None and loaded_rules:
                         try:
-                            processed_frame = (
-                                draw_pose_keypoints(frame.copy(), detections, loaded_rules)
-                                if detections.get("keypoints")
-                                else draw_bounding_boxes(frame.copy(), detections, loaded_rules)
-                            )
+                            # Use unified drawing function (handles all rule types automatically)
+                            processed_frame = draw_detections_unified(frame.copy(), detections, loaded_rules)
                             agent_id = task.get("agent_id") or task_id
                             frame_bytes = processed_frame.tobytes()
                             height, width = processed_frame.shape[0], processed_frame.shape[1]
@@ -498,7 +555,14 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
 
                     if event and event.get("label"):
                         event_label = str(event["label"]).strip()
-                        print(f"[worker {task_id}] 🔔 {event_label} | agent='{agent_name}' | video_time={video_ts}")
+                        # Make weapon detection alerts more prominent
+                        if any(keyword in event_label.lower() for keyword in ["gun detected", "knife detected", "weapon detected"]):
+                            weapon_label = event_label.upper()
+                            print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 20} WEAPON DETECTED {'=' * 20}")
+                            print(f"[worker {task_id}] 🚨🚨🚨 {weapon_label} 🚨🚨🚨 | agent='{agent_name}' | video_time={video_ts}")
+                            print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 60}")
+                        else:
+                            print(f"[worker {task_id}] 🔔 {event_label} | agent='{agent_name}' | video_time={video_ts}")
                     else:
                         print(f"[worker {task_id}] ℹ️ No rule match | agent='{agent_name}' | video_time={video_ts}")
 

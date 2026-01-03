@@ -124,6 +124,7 @@ class AWSSignalingClient:
                     
                     # Add video track from shared_store
                     track = SharedStoreVideoTrack(self.camera_id, self.shared_store)
+                    #  adds the video track to the WebRTC peer connection
                     self.pc.addTrack(track)
                     print(f"[aws-client {self.camera_id}] 🎥 Added video track")
                     
