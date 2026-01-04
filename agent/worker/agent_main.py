@@ -37,7 +37,7 @@ from agent.rule_engine.engine import evaluate_rules
 from agent.worker.video_io import open_video_capture
 from agent.worker.detections import extract_all_detections
 from agent.worker.frame_hub import reconstruct_frame
-from agent.worker.frame_processor import draw_detections_unified
+from agent.worker.frame_processor import draw_detections_unified, filter_detections_by_zone
 from agent.worker.model_capabilities import detect_model_capabilities, get_models_needed_by_rules
 import numpy as np
 
@@ -315,6 +315,34 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                     "ts": datetime.now(timezone.utc),
                 }
                 
+                # Filter detections by restricted zone if required
+                requires_zone = task.get("requires_zone", False)
+                zone = task.get("zone", {})
+                
+                if requires_zone and zone:
+                    zone_type = zone.get("type", "").lower()
+                    zone_coordinates = zone.get("coordinates", [])
+                    
+                    if zone_type == "polygon" and zone_coordinates:
+                        # Get frame dimensions
+                        frame_height, frame_width = frame.shape[:2]
+                        
+                        # Count detections before filtering
+                        detections_before = len(detections.get("classes", []))
+                        
+                        # Filter detections to only include objects inside the zone
+                        detections = filter_detections_by_zone(detections, zone_coordinates, frame_height, frame_width)
+                        
+                        # Count detections after filtering
+                        detections_after = len(detections.get("classes", []))
+                        
+                        # If any objects were detected in the restricted zone, log it
+                        if detections_after > 0:
+                            print(f"[worker {task_id}] 🚨 ALERT: {detections_after} object(s) detected in restricted zone!")
+                            for idx, cls in enumerate(detections.get("classes", [])):
+                                score = detections.get("scores", [])[idx] if idx < len(detections.get("scores", [])) else None
+                                print(f"[worker {task_id}]    └─ {cls} detected in restricted zone" + (f" (score: {score:.2f})" if score else ""))
+                
                 # Debug: Log keypoint extraction (first frame and every 30 frames)
                 if frame_index == 1 or frame_index % 30 == 0:
                     if merged_keypoints:
@@ -326,8 +354,8 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                 if shared_store is not None and loaded_rules:
                     try:
                         # Use unified drawing function (handles all rule types automatically)
-                        print("detecttions: ", detections)
-                        processed_frame = draw_detections_unified(frame.copy(), detections, loaded_rules)
+                        # Pass task so zone can be drawn
+                        processed_frame = draw_detections_unified(frame.copy(), detections, loaded_rules, task)
                         # Get agent_id from task (use agent_id if available, else use task_id)
                         agent_id = task.get("agent_id") or task_id
                         
@@ -521,11 +549,40 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                         "ts": datetime.now(timezone.utc),
                     }
                     
+                    # Filter detections by restricted zone if required (patrol mode)
+                    requires_zone = task.get("requires_zone", False)
+                    zone = task.get("zone", {})
+                    
+                    if requires_zone and zone:
+                        zone_type = zone.get("type", "").lower()
+                        zone_coordinates = zone.get("coordinates", [])
+                        
+                        if zone_type == "polygon" and zone_coordinates:
+                            # Get frame dimensions
+                            frame_height, frame_width = frame.shape[:2]
+                            
+                            # Count detections before filtering
+                            detections_before = len(detections.get("classes", []))
+                            
+                            # Filter detections to only include objects inside the zone
+                            detections = filter_detections_by_zone(detections, zone_coordinates, frame_height, frame_width)
+                            
+                            # Count detections after filtering
+                            detections_after = len(detections.get("classes", []))
+                            
+                            # If any objects were detected in the restricted zone, log it
+                            if detections_after > 0:
+                                print(f"[worker {task_id}] 🚨 ALERT: {detections_after} object(s) detected in restricted zone!")
+                                for idx, cls in enumerate(detections.get("classes", [])):
+                                    score = detections.get("scores", [])[idx] if idx < len(detections.get("scores", [])) else None
+                                    print(f"[worker {task_id}]    └─ {cls} detected in restricted zone" + (f" (score: {score:.2f})" if score else ""))
+                    
                     # Draw detections using unified pipeline (patrol mode)
                     if shared_store is not None and loaded_rules:
                         try:
                             # Use unified drawing function (handles all rule types automatically)
-                            processed_frame = draw_detections_unified(frame.copy(), detections, loaded_rules)
+                            # Pass task so zone can be drawn
+                            processed_frame = draw_detections_unified(frame.copy(), detections, loaded_rules, task)
                             agent_id = task.get("agent_id") or task_id
                             frame_bytes = processed_frame.tobytes()
                             height, width = processed_frame.shape[0], processed_frame.shape[1]

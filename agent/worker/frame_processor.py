@@ -66,7 +66,262 @@ def _draw_label_with_background(frame, x1, y1, label_text, color_bgr, font_scale
     )
 
 # ========================================================================
-# Check boxes overlap
+# Zone Utilities - Check if objects are inside restricted zone
+# ========================================================================
+################################################################################
+# Check if point is inside the polygon
+################################################################################
+def is_point_in_polygon(point_x: float, point_y: float, polygon: List[List[float]]) -> bool:
+    """
+    Check if a point (x, y) is inside a polygon using ray casting algorithm.
+    
+    This is a simple algorithm that works by casting a ray from the point
+    to infinity and counting how many polygon edges it crosses.
+    If the count is odd, the point is inside; if even, it's outside.
+    
+    Args:
+        point_x: X coordinate of the point
+        point_y: Y coordinate of the point
+        polygon: List of [x, y] coordinates defining the polygon
+    
+    Returns:
+        True if point is inside polygon, False otherwise
+    """
+    if not polygon or len(polygon) < 3:
+        return False
+    
+    # Count how many polygon edges the ray crosses
+    crossings = 0
+    num_points = len(polygon)
+    
+    for i in range(num_points):
+        # Get current point and next point (wrapping around)
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % num_points]
+        
+        # Check if ray crosses this edge
+        # Ray goes from (point_x, point_y) to (infinity, point_y)
+        if ((y1 > point_y) != (y2 > point_y)):  # Edge crosses the ray's y-level
+            # Calculate x-coordinate where edge crosses the ray
+            if point_x < (x2 - x1) * (point_y - y1) / (y2 - y1) + x1:
+                crossings += 1
+    
+    # Odd number of crossings means point is inside
+    return crossings % 2 == 1
+
+################################################################################
+# Check if bounding box is inside the restricted zone
+################################################################################
+def is_box_in_zone(box: List[float], zone_polygon: List[List[float]]) -> bool:
+    """
+    Check if a bounding box is inside the restricted zone.
+    Uses Option 2: Check if ANY corner of the box is inside the polygon.
+    
+    Args:
+        box: Bounding box as [x1, y1, x2, y2] (top-left and bottom-right)
+        zone_polygon: List of [x, y] coordinates defining the zone polygon
+    
+    Returns:
+        True if any corner of the box is inside the zone, False otherwise
+    """
+    if not box or len(box) < 4:
+        return False
+    
+    if not zone_polygon or len(zone_polygon) < 3:
+        return False
+    
+    x1, y1, x2, y2 = box
+    
+    # Get all four corners of the bounding box
+    corners = [
+        (x1, y1),  # Top-left
+        (x2, y1),  # Top-right
+        (x2, y2),  # Bottom-right
+        (x1, y2)   # Bottom-left
+    ]
+    
+    # Check if ANY corner is inside the polygon
+    for corner_x, corner_y in corners:
+        if is_point_in_polygon(corner_x, corner_y, zone_polygon):
+            return True
+    
+    return False
+
+################################################################################
+# Check if person mask overlaps with the restricted zone
+################################################################################
+def is_mask_in_zone(mask: np.ndarray, zone_polygon: List[List[float]], frame_height: int, frame_width: int) -> bool:
+    """
+    Check if a person mask overlaps with the restricted zone.
+    
+    This checks if any part of the mask is inside the polygon by:
+    1. Finding all non-zero pixels in the mask
+    2. Checking if any of those pixels are inside the polygon
+    
+    Args:
+        mask: Binary mask (numpy array)
+        zone_polygon: List of [x, y] coordinates defining the zone polygon
+        frame_height: Height of the frame
+        frame_width: Width of the frame
+    
+    Returns:
+        True if mask overlaps with zone, False otherwise
+    """
+    if mask is None or mask.size == 0:
+        return False
+    
+    if not zone_polygon or len(zone_polygon) < 3:
+        return False
+    
+    # Resize mask to frame dimensions if needed
+    if mask.shape[:2] != (frame_height, frame_width):
+        mask = cv2.resize(mask, (frame_width, frame_height), interpolation=cv2.INTER_NEAREST)
+    
+    # Ensure mask is binary (0 or 255)
+    if mask.max() <= 1:
+        mask = (mask * 255).astype(np.uint8)
+    
+    # Convert to 2D if needed
+    if len(mask.shape) == 3:
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    
+    # Find all non-zero pixels (where the person is)
+    coords = np.column_stack(np.where(mask > 0))
+    
+    if len(coords) == 0:
+        return False
+    
+    # Check if ANY pixel of the mask is inside the polygon
+    # We sample some pixels to avoid checking every single one (for performance)
+    # Check center point and a few sample points
+    sample_indices = [0, len(coords) // 4, len(coords) // 2, 3 * len(coords) // 4, len(coords) - 1]
+    
+    for idx in sample_indices:
+        if idx < len(coords):
+            y, x = coords[idx]
+            if is_point_in_polygon(float(x), float(y), zone_polygon):
+                return True
+    
+    return False
+
+################################################################################    
+# Filter detections by restricted zone
+################################################################################
+def filter_detections_by_zone(
+    detections: Dict[str, Any],
+    zone_polygon: List[List[float]],
+    frame_height: int,
+    frame_width: int
+) -> Dict[str, Any]:
+    """
+    Filter detections to only include objects inside the restricted zone.
+    Works with both bounding boxes and masks.
+    
+    Args:
+        detections: Detection dictionary with boxes, classes, scores, masks, etc.
+        zone_polygon: List of [x, y] coordinates defining the zone polygon
+        frame_height: Height of the frame
+        frame_width: Width of the frame
+    
+    Returns:
+        Filtered detection dictionary (only objects inside zone)
+    """
+    boxes = detections.get("boxes", [])
+    classes = detections.get("classes", [])
+    scores = detections.get("scores", [])
+    masks = detections.get("masks", [])
+    keypoints = detections.get("keypoints", [])
+    
+    if not boxes or not classes:
+        return detections
+    
+    # Keep track of which detections are inside the zone
+    valid_indices = []
+    
+    for idx in range(len(boxes)):
+        box = boxes[idx]
+        mask = masks[idx] if idx < len(masks) else None
+        
+        # Check if this detection is in the zone
+        is_in_zone = False
+        
+        if mask is not None:
+            # Check mask overlap with zone
+            is_in_zone = is_mask_in_zone(mask, zone_polygon, frame_height, frame_width)
+        else:
+            # Check bounding box corners
+            is_in_zone = is_box_in_zone(box, zone_polygon)
+        
+        if is_in_zone:
+            valid_indices.append(idx)
+    
+    # Filter all detection arrays to only keep valid indices
+    filtered_boxes = [boxes[i] for i in valid_indices]
+    filtered_classes = [classes[i] for i in valid_indices]
+    filtered_scores = [scores[i] for i in valid_indices]
+    filtered_masks = [masks[i] for i in valid_indices if i < len(masks)]
+    filtered_keypoints = [keypoints[i] for i in valid_indices if i < len(keypoints)]
+    
+    # Create filtered detections dictionary
+    filtered_detections = {
+        "classes": filtered_classes,
+        "scores": filtered_scores,
+        "boxes": filtered_boxes,
+        "masks": filtered_masks,
+        "keypoints": filtered_keypoints,
+        "ts": detections.get("ts"),
+    }
+    
+    return filtered_detections
+
+################################################################################
+# Draw restricted zone polygon
+################################################################################
+
+def draw_zone_polygon(frame: np.ndarray, zone_polygon: List[List[float]], zone_color: Tuple[int, int, int] = (0, 255, 255)) -> np.ndarray:
+    """
+    Draw the restricted zone polygon on the frame.
+    Draws both the outline and a semi-transparent fill.
+    
+    Args:
+        frame: Frame to draw on
+        zone_polygon: List of [x, y] coordinates defining the zone polygon
+        zone_color: Color for the zone (BGR format), default is yellow
+    
+    Returns:
+        Frame with zone polygon drawn
+    """
+    if cv2 is None:
+        return frame
+    
+    if not zone_polygon or len(zone_polygon) < 3:
+        return frame
+    
+    # Convert polygon to numpy array format for OpenCV
+    polygon_points = np.array(zone_polygon, dtype=np.int32)
+    
+    # Create a copy of the frame
+    result_frame = frame.copy()
+    
+    # Draw filled polygon with transparency
+    overlay = result_frame.copy()
+    cv2.fillPoly(overlay, [polygon_points], zone_color)
+    alpha = 0.3  # Transparency (0.0 = fully transparent, 1.0 = fully opaque)
+    result_frame = cv2.addWeighted(result_frame, 1 - alpha, overlay, alpha, 0)
+    
+    # Draw polygon outline (thicker, more visible)
+    cv2.polylines(result_frame, [polygon_points], isClosed=True, color=zone_color, thickness=3)
+    
+    # Draw label at the first point
+    if len(zone_polygon) > 0:
+        label_x, label_y = int(zone_polygon[0][0]), int(zone_polygon[0][1])
+        _draw_label_with_background(result_frame, label_x, label_y, "RESTRICTED ZONE", zone_color, font_scale=0.6)
+    
+    return result_frame
+
+
+# ========================================================================
+# Check if two bounding boxes overlap
 # ========================================================================
 
 def _check_boxes_overlap(box1, box2):
@@ -138,7 +393,8 @@ def _check_boxes_overlap(box1, box2):
 def draw_detections_unified(
     frame: np.ndarray,
     detections: Dict[str, Any],
-    rules: List[Dict[str, Any]]
+    rules: List[Dict[str, Any]],
+    task: Optional[Dict[str, Any]] = None
 ) -> np.ndarray:
     """
     Unified drawing function that handles ALL types of detections.
@@ -150,16 +406,18 @@ def draw_detections_unified(
     - draw_person_masks
     
     How it works:
-    1. Analyze rules to determine what to visualize
-    2. Draw boxes for relevant classes
-    3. Draw keypoints if needed
-    4. Apply special overlays (weapon masks, etc.)
-    5. Draw person masks (if needed)
+    1. Draw restricted zone polygon (if requires_zone is true)
+    2. Analyze rules to determine what to visualize
+    3. Draw boxes for relevant classes
+    4. Draw keypoints if needed
+    5. Apply special overlays (weapon masks, etc.)
+    6. Draw person masks (if needed)
 
     Args:
         frame: Input frame (numpy array in BGR format)
         detections: Detection dictionary with boxes, classes, scores, keypoints, masks
         rules: List of rule dictionaries
+        task: Task dictionary (optional, needed for zone drawing)
     
     Returns:
         Frame with all visualizations drawn
@@ -170,14 +428,28 @@ def draw_detections_unified(
     if not rules:
         return frame
     
-    # Step 1: Analyze rules to get visualization configuration
-    viz_config = analyze_rules_for_visualization(rules)
-    
-    # Step 2: Make a copy of the frame (don't modify original)
+    # Step 1: Make a copy of the frame (don't modify original)
     processed_frame = frame.copy()
     height, width = processed_frame.shape[:2]
     
-    # Step 3: Identify armed people (if weapon detection is enabled)
+    # Step 2: Draw restricted zone polygon if required
+    # Check if task has requires_zone flag and zone coordinates
+    if task:
+        requires_zone = task.get("requires_zone", False)
+        zone = task.get("zone", {})
+        
+        if requires_zone and zone:
+            zone_type = zone.get("type", "").lower()
+            zone_coordinates = zone.get("coordinates", [])
+            
+            if zone_type == "polygon" and zone_coordinates:
+                # Draw the restricted zone polygon (yellow color)
+                processed_frame = draw_zone_polygon(processed_frame, zone_coordinates, zone_color=(0, 255, 255))
+    
+    # Step 3: Analyze rules to get visualization configuration
+    viz_config = analyze_rules_for_visualization(rules)
+    
+    # Step 4: Identify armed people (if weapon detection is enabled)
     # This needs to happen before drawing masks so we know which persons are armed
     armed_person_indices = set()
     if viz_config.get("draw_weapon_overlays", False):
@@ -185,7 +457,7 @@ def draw_detections_unified(
         # Store armed person info in detections for mask drawing
         detections["armed_person_indices"] = armed_person_indices
     
-    # Step 4: Draw bounding boxes for relevant classes
+    # Step 5: Draw bounding boxes for relevant classes
     if viz_config.get("draw_boxes", False):
         processed_frame = _draw_boxes_unified(
             processed_frame,
@@ -193,7 +465,7 @@ def draw_detections_unified(
             viz_config
         )
     
-    # Step 5: Draw keypoints (if needed)
+    # Step 6: Draw keypoints (if needed)
     # Keypoints go last so they're visible on top
     if viz_config.get("draw_keypoints", False):
         processed_frame = _draw_keypoints_unified(
@@ -202,14 +474,14 @@ def draw_detections_unified(
             viz_config
         )
 
-    # Step 6: Draw person masks (if needed) - green for normal, red for armed
+    # Step 7: Draw person masks (if needed) - green for normal, red for armed
     if viz_config.get("draw_person_masks", False):
         processed_frame = _draw_person_masks(
             processed_frame,
             detections
         )
     
-    # Step 7: Draw weapon overlays (weapon masks in red)
+    # Step 8: Draw weapon overlays (weapon masks in red)
     if viz_config.get("draw_weapon_overlays", False):
         processed_frame = _draw_weapon_overlays(
             processed_frame, 
@@ -269,9 +541,14 @@ def _draw_boxes_unified(
                         # Skip box drawing for this detection (mask will be drawn instead)
                         continue
         
-        # Also skip boxes for persons if person masks are being drawn
+        # Also skip boxes for persons if person masks are being drawn AND masks are available
+        # Only skip if we actually have masks to draw, otherwise draw the box
         if draw_person_masks and str(cls).lower() == "person":
-            continue
+            # Check if masks are actually available for this detection
+            if has_masks and idx < len(masks) and masks[idx] is not None:
+                # Skip box (mask will be drawn instead)
+                continue
+            # If no masks available, draw the box normally
         
         # Get box coordinates
         x1, y1, x2, y2 = map(int, box)
@@ -457,7 +734,7 @@ def _draw_person_masks(
     return frame
 
 ################################################################################
-# Draw weapon overlays
+# Check if weapon mask overlaps with person mask
 ################################################################################
 
 def _check_weapon_mask_overlap(weapon_box: List[float], person_mask: np.ndarray) -> bool:
@@ -501,7 +778,9 @@ def _check_weapon_mask_overlap(weapon_box: List[float], person_mask: np.ndarray)
     
     return False
 
-
+################################################################################
+# Identify armed people (have weapons overlapping with their masks)
+################################################################################
 def _identify_armed_people(
     detections: Dict[str, Any],
     viz_config: Dict[str, Any]
@@ -562,7 +841,9 @@ def _identify_armed_people(
     
     return armed_people_indices
 
-
+################################################################################
+# Draw weapon overlays (weapon masks in red) - fallback for weapons without masks
+################################################################################
 def _draw_weapon_overlays(
     frame: np.ndarray,
     detections: Dict[str, Any],
