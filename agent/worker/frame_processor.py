@@ -76,14 +76,14 @@ def _check_boxes_overlap(box1, box2):
     This uses IoU (Intersection over Union) - a common way to measure box overlap.
     IoU = (Area of overlap) / (Area of union)
     
-    Example: If IoU = 0.5, it means boxes overlap 50% of their combined area.
+    Example: If IoU = 0.05, it means boxes overlap 5% of their combined area.
     
     Args:
         box1: First box as [x1, y1, x2, y2] (top-left and bottom-right corners)
         box2: Second box as [x1, y1, x2, y2]
     
     Returns:
-        True if boxes overlap enough (IoU > 0.1), False otherwise
+        True if boxes overlap enough (IoU > 0.01), False otherwise
     """
     # Extract coordinates from both boxes
     box1_x1, box1_y1, box1_x2, box1_y2 = box1
@@ -123,11 +123,16 @@ def _check_boxes_overlap(box1, box2):
     
     # Step 8: Return True if overlap is more than 10%
     # This means the weapon and person boxes overlap at least 10%
-    return iou_ratio > 0.1
+    return iou_ratio > 0.05
 
 
 # ========================================================================
 # Unified Drawing Pipeline
+# handles ALL types of detections and visualizations
+# This replaces the old rule-specific methods:
+# - draw_weapon_detections
+# - draw_pose_keypoints
+# - draw_bounding_boxes
 # ========================================================================
 
 def draw_detections_unified(
@@ -142,16 +147,18 @@ def draw_detections_unified(
     - draw_weapon_detections
     - draw_pose_keypoints
     - draw_bounding_boxes
+    - draw_person_masks
     
     How it works:
     1. Analyze rules to determine what to visualize
     2. Draw boxes for relevant classes
     3. Draw keypoints if needed
     4. Apply special overlays (weapon masks, etc.)
-    
+    5. Draw person masks (if needed)
+
     Args:
         frame: Input frame (numpy array in BGR format)
-        detections: Detection dictionary with boxes, classes, scores, keypoints
+        detections: Detection dictionary with boxes, classes, scores, keypoints, masks
         rules: List of rule dictionaries
     
     Returns:
@@ -170,14 +177,13 @@ def draw_detections_unified(
     processed_frame = frame.copy()
     height, width = processed_frame.shape[:2]
     
-    # Step 3: Draw weapon overlays first (if needed)
-    # This goes first so boxes and keypoints can be drawn on top
+    # Step 3: Identify armed people (if weapon detection is enabled)
+    # This needs to happen before drawing masks so we know which persons are armed
+    armed_person_indices = set()
     if viz_config.get("draw_weapon_overlays", False):
-        processed_frame = _draw_weapon_overlays(
-            processed_frame, 
-            detections, 
-            viz_config
-        )
+        armed_person_indices = _identify_armed_people(detections, viz_config)
+        # Store armed person info in detections for mask drawing
+        detections["armed_person_indices"] = armed_person_indices
     
     # Step 4: Draw bounding boxes for relevant classes
     if viz_config.get("draw_boxes", False):
@@ -195,6 +201,21 @@ def draw_detections_unified(
             detections,
             viz_config
         )
+
+    # Step 6: Draw person masks (if needed) - green for normal, red for armed
+    if viz_config.get("draw_person_masks", False):
+        processed_frame = _draw_person_masks(
+            processed_frame,
+            detections
+        )
+    
+    # Step 7: Draw weapon overlays (weapon masks in red)
+    if viz_config.get("draw_weapon_overlays", False):
+        processed_frame = _draw_weapon_overlays(
+            processed_frame, 
+            detections, 
+            viz_config
+        )
     
     return processed_frame
 
@@ -209,6 +230,7 @@ def _draw_boxes_unified(
 ) -> np.ndarray:
     """
     Draw bounding boxes based on visualization config.
+    Skips drawing boxes for detections that have masks (when segmentation is active).
     
     Args:
         frame: Frame to draw on
@@ -216,20 +238,39 @@ def _draw_boxes_unified(
         viz_config: Visualization configuration
     
     Returns:
-        Frame with boxes drawn
+        Frame with boxes drawn (only for detections without masks)
     """
     boxes = detections.get("boxes", [])
     classes = detections.get("classes", [])
     scores = detections.get("scores", [])
+    masks = detections.get("masks", [])
+    has_masks = detections.get("has_masks", False)
     
     if not boxes or not classes:
         return frame
     
     height, width = frame.shape[:2]
     
+    # Check if masks are being drawn (if person masks are enabled, skip boxes for persons)
+    draw_person_masks = viz_config.get("draw_person_masks", False)
+    
     # Draw each box if it matches the config
-    for box, cls, score in zip(boxes, classes, scores):
+    for idx, (box, cls, score) in enumerate(zip(boxes, classes, scores)):
         if not should_draw_box(cls, viz_config):
+            continue
+        
+        # Skip drawing box if mask is available for this detection
+        if has_masks and idx < len(masks):
+            mask = masks[idx]
+            if mask is not None:
+                # Check if mask has any non-zero pixels (valid mask)
+                if isinstance(mask, np.ndarray) and mask.size > 0:
+                    if mask.max() > 0:  # Mask has content
+                        # Skip box drawing for this detection (mask will be drawn instead)
+                        continue
+        
+        # Also skip boxes for persons if person masks are being drawn
+        if draw_person_masks and str(cls).lower() == "person":
             continue
         
         # Get box coordinates
@@ -325,8 +366,202 @@ def _draw_keypoints_unified(
     return frame
 
 ################################################################################
+# Draw person masks
+################################################################################
+
+def _draw_person_masks(
+    frame: np.ndarray,
+    detections: Dict[str, Any],
+) -> np.ndarray:
+    """
+    Draw person masks as colored overlays on the frame.
+    - Green masks for normal persons
+    - Red masks for armed persons (with weapons)
+    Only draws masks for detections where class is "person".
+    Includes labels since boxes are skipped when masks are available.
+    
+    Args:
+        frame: Frame to draw on
+        detections: Detection data (may contain "armed_person_indices")
+    
+    Returns:
+        Frame with person masks drawn as colored overlays
+    """
+    masks = detections.get("masks", [])
+    classes = detections.get("classes", [])
+    scores = detections.get("scores", [])
+    armed_person_indices = detections.get("armed_person_indices", set())
+    
+    if not masks:
+        return frame
+    
+    height, width = frame.shape[:2]
+    
+    # Default color for person masks (BGR format - green)
+    default_mask_color = (0, 255, 0)  # Green in BGR
+    armed_mask_color = (0, 0, 255)  # Red in BGR
+    alpha = 0.4  # Transparency (0.0 = fully transparent, 1.0 = fully opaque)
+    
+    # Draw masks only for person detections
+    # Masks array should align with classes array (one mask per detection)
+    for idx, mask in enumerate(masks):
+        if mask is None:
+            continue
+        
+        # Only draw mask if corresponding class is "person"
+        if idx < len(classes) and str(classes[idx]).lower() == "person":
+            # Determine color: red if armed, green otherwise
+            is_armed = idx in armed_person_indices
+            mask_color = armed_mask_color if is_armed else default_mask_color
+            label_text = "ARMED PERSON" if is_armed else "person"
+            
+            mask = mask.astype(np.uint8)
+            
+            # Resize mask to frame dimensions if needed
+            if mask.shape[:2] != (height, width):
+                mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+            
+            # Ensure mask is binary (0 or 255)
+            if mask.max() <= 1:
+                mask = (mask * 255).astype(np.uint8)
+            
+            # Create colored overlay: create a colored image with the mask shape
+            colored_overlay = np.zeros((height, width, 3), dtype=np.uint8)
+            colored_overlay[:] = mask_color
+            
+            # Apply mask to the colored overlay (only show color where mask is non-zero)
+            mask_3channel = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) if len(mask.shape) == 2 else mask
+            mask_binary = (mask_3channel > 0).astype(np.uint8)
+            colored_overlay = colored_overlay * mask_binary
+            
+            # Blend the colored overlay with the original frame
+            frame = cv2.addWeighted(frame, 1.0, colored_overlay, alpha, 0)
+            
+            # Draw label on the mask (since box is not drawn)
+            # Find the top-left point of the mask for label placement
+            mask_2d = mask if len(mask.shape) == 2 else cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+            coords = np.column_stack(np.where(mask_2d > 0))
+            if len(coords) > 0:
+                y_min, x_min = coords.min(axis=0)
+                label_x = max(0, min(int(x_min), width - 1))
+                label_y = max(0, min(int(y_min), height - 1))
+                
+                # Get score if available
+                score = scores[idx] if idx < len(scores) else None
+                if score and not is_armed:
+                    label_text += f" {score:.2f}"
+                
+                # Draw label with mask color
+                _draw_label_with_background(frame, label_x, label_y, label_text, mask_color, font_scale=0.5)
+    
+    return frame
+
+################################################################################
 # Draw weapon overlays
 ################################################################################
+
+def _check_weapon_mask_overlap(weapon_box: List[float], person_mask: np.ndarray) -> bool:
+    """
+    Check if a weapon bounding box overlaps with a person mask.
+    
+    Args:
+        weapon_box: Weapon bounding box [x1, y1, x2, y2]
+        person_mask: Binary person mask (numpy array)
+    
+    Returns:
+        True if weapon overlaps with person mask, False otherwise
+    """
+    if person_mask is None or person_mask.size == 0:
+        return False
+    
+    x1, y1, x2, y2 = map(int, weapon_box)
+    height, width = person_mask.shape[:2]
+    
+    # Clamp coordinates to mask boundaries
+    x1 = max(0, min(x1, width - 1))
+    y1 = max(0, min(y1, height - 1))
+    x2 = max(0, min(x2, width - 1))
+    y2 = max(0, min(y2, height - 1))
+    
+    if x2 <= x1 or y2 <= y1:
+        return False
+    
+    # Extract the region of the mask where the weapon box is
+    weapon_region_mask = person_mask[y1:y2, x1:x2]
+    
+    # Check if any pixels in the weapon box region are part of the person mask
+    # (i.e., mask value > 0)
+    if weapon_region_mask.size > 0:
+        overlap_pixels = np.sum(weapon_region_mask > 0)
+        total_pixels = weapon_region_mask.size
+        overlap_ratio = overlap_pixels / total_pixels if total_pixels > 0 else 0.0
+        
+        # Consider it an overlap if at least 5% of the weapon box overlaps with the mask
+        return overlap_ratio > 0.05
+    
+    return False
+
+
+def _identify_armed_people(
+    detections: Dict[str, Any],
+    viz_config: Dict[str, Any]
+) -> set:
+    """
+    Identify which persons are armed (have weapons overlapping with their masks).
+    Returns a set of detection indices for armed persons.
+    
+    Args:
+        detections: Detection data (with boxes, classes, scores, masks)
+        viz_config: Visualization configuration
+    
+    Returns:
+        Set of detection indices for armed persons
+    """
+    boxes = detections.get("boxes", [])
+    classes = detections.get("classes", [])
+    masks = detections.get("masks", [])
+    
+    if not boxes or not classes:
+        return set()
+    
+    weapon_overlay_classes = viz_config.get("weapon_overlay_classes", set())
+    if not weapon_overlay_classes:
+        return set()
+    
+    # Separate weapons and people (with their masks)
+    weapons_found = []
+    people_found = []  # (box, cls, score, mask, index)
+    
+    for idx, (box, cls) in enumerate(zip(boxes, classes)):
+        cls_lower = str(cls).lower()
+        
+        # Check if weapon
+        is_weapon = any(weapon in cls_lower for weapon in weapon_overlay_classes)
+        if is_weapon:
+            weapons_found.append((box, cls_lower, idx))
+        elif cls_lower == "person":
+            # Get corresponding mask if available
+            person_mask = masks[idx] if idx < len(masks) else None
+            people_found.append((box, cls_lower, person_mask, idx))
+    
+    # Match weapons to people using mask overlap
+    armed_people_indices = set()
+    
+    for weapon_box, weapon_cls, weapon_det_idx in weapons_found:
+        for person_box, person_cls, person_mask, person_det_idx in people_found:
+            # Check if weapon overlaps with person mask
+            if person_mask is not None:
+                if _check_weapon_mask_overlap(weapon_box, person_mask):
+                    armed_people_indices.add(person_det_idx)
+                    break
+            else:
+                # Fallback to box overlap if no mask available
+                if _check_boxes_overlap(weapon_box, person_box):
+                    armed_people_indices.add(person_det_idx)
+                    break
+    
+    return armed_people_indices
+
 
 def _draw_weapon_overlays(
     frame: np.ndarray,
@@ -334,17 +569,13 @@ def _draw_weapon_overlays(
     viz_config: Dict[str, Any]
 ) -> np.ndarray:
     """
-    Draw special weapon detection overlays (red masks on armed persons).
-    
-    This is the complex weapon detection logic that:
-    1. Finds weapons and people
-    2. Matches weapons to people (by overlap)
-    3. Draws red overlay on armed persons
-    4. Draws weapon boxes for unmatched weapons
+    Draw weapon masks in red color.
+    Weapons that overlap with person masks are drawn with red masks.
+    Unmatched weapons are drawn with red boxes.
     
     Args:
         frame: Frame to draw on
-        detections: Detection data
+        detections: Detection data (with boxes, classes, scores, masks)
         viz_config: Visualization configuration
     
     Returns:
@@ -353,6 +584,8 @@ def _draw_weapon_overlays(
     boxes = detections.get("boxes", [])
     classes = detections.get("classes", [])
     scores = detections.get("scores", [])
+    masks = detections.get("masks", [])
+    armed_person_indices = detections.get("armed_person_indices", set())
     
     if not boxes or not classes:
         return frame
@@ -363,74 +596,70 @@ def _draw_weapon_overlays(
     
     height, width = frame.shape[:2]
     
-    # Separate weapons and people
+    # Find weapons
     weapons_found = []
-    people_found = []
-    
-    for box, cls, score in zip(boxes, classes, scores):
+    for idx, (box, cls, score) in enumerate(zip(boxes, classes, scores)):
         cls_lower = str(cls).lower()
-        
-        # Check if weapon
         is_weapon = any(weapon in cls_lower for weapon in weapon_overlay_classes)
         if is_weapon:
-            weapons_found.append((box, cls_lower, score))
-        elif cls_lower == "person":
-            people_found.append((box, cls_lower, score))
+            weapon_mask = masks[idx] if idx < len(masks) else None
+            weapons_found.append((box, cls_lower, score, weapon_mask, idx))
     
-    # Match weapons to people
-    armed_people_indices = set()
-    matched_weapons = set()
+    # Draw weapon masks in red
+    red_color = (0, 0, 255)  # Red in BGR
+    alpha = 0.5  # Transparency
     
-    for weapon_idx, (weapon_box, weapon_cls, weapon_score) in enumerate(weapons_found):
-        for person_idx, (person_box, person_cls, person_score) in enumerate(people_found):
-            if _check_boxes_overlap(weapon_box, person_box):
-                armed_people_indices.add(person_idx)
-                matched_weapons.add(weapon_idx)
-                break
-    
-    # Draw red overlay on armed people
-    for person_idx in armed_people_indices:
-        person_box, person_cls, person_score = people_found[person_idx]
-        x1, y1, x2, y2 = map(int, person_box)
-        
-        x1 = max(0, min(x1, width - 1))
-        y1 = max(0, min(y1, height - 1))
-        x2 = max(0, min(x2, width - 1))
-        y2 = max(0, min(y2, height - 1))
-        
-        if x2 > x1 and y2 > y1:
-            # Apply red overlay
-            person_region = frame[y1:y2, x1:x2]
-            if person_region.size > 0:
-                red_mask = person_region.copy()
-                red_mask[:, :] = (0, 0, 255)  # Red in BGR
-                alpha = 0.5
-                blended = cv2.addWeighted(person_region, 1 - alpha, red_mask, alpha, 0)
-                frame[y1:y2, x1:x2] = blended
+    for weapon_box, weapon_cls, weapon_score, weapon_mask, weapon_det_idx in weapons_found:
+        if weapon_mask is not None:
+            # Draw weapon mask in red
+            mask = weapon_mask.astype(np.uint8)
             
-            # Draw red border
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            # Resize mask to frame dimensions if needed
+            if mask.shape[:2] != (height, width):
+                mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
             
-            # Draw label
-            _draw_label_with_background(frame, x1, y1, "ARMED PERSON", (0, 0, 255))
-    
-    # Draw unmatched weapons
-    for weapon_idx, (weapon_box, weapon_cls, weapon_score) in enumerate(weapons_found):
-        if weapon_idx in matched_weapons:
-            continue
-        
-        x1, y1, x2, y2 = map(int, weapon_box)
-        x1 = max(0, min(x1, width - 1))
-        y1 = max(0, min(y1, height - 1))
-        x2 = max(0, min(x2, width - 1))
-        y2 = max(0, min(y2, height - 1))
-        
-        if x2 > x1 and y2 > y1:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-            label = f"WEAPON DETECTED ({weapon_cls})"
-            if weapon_score:
-                label += f" {weapon_score:.2f}"
-            _draw_label_with_background(frame, x1, y1, label, (0, 0, 255))
+            # Ensure mask is binary (0 or 255)
+            if mask.max() <= 1:
+                mask = (mask * 255).astype(np.uint8)
+            
+            # Create red overlay using the weapon mask
+            colored_overlay = np.zeros((height, width, 3), dtype=np.uint8)
+            colored_overlay[:] = red_color
+            
+            # Apply mask to the colored overlay
+            mask_3channel = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) if len(mask.shape) == 2 else mask
+            mask_binary = (mask_3channel > 0).astype(np.uint8)
+            colored_overlay = colored_overlay * mask_binary
+            
+            # Blend the red overlay with the original frame
+            frame = cv2.addWeighted(frame, 1.0, colored_overlay, alpha, 0)
+            
+            # Draw label on weapon mask
+            mask_2d = mask if len(mask.shape) == 2 else cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+            coords = np.column_stack(np.where(mask_2d > 0))
+            if len(coords) > 0:
+                y_min, x_min = coords.min(axis=0)
+                label_x = max(0, min(int(x_min), width - 1))
+                label_y = max(0, min(int(y_min), height - 1))
+                
+                label = f"WEAPON ({weapon_cls})"
+                if weapon_score:
+                    label += f" {weapon_score:.2f}"
+                _draw_label_with_background(frame, label_x, label_y, label, red_color, font_scale=0.5)
+        else:
+            # Fallback: draw box for weapons without masks
+            x1, y1, x2, y2 = map(int, weapon_box)
+            x1 = max(0, min(x1, width - 1))
+            y1 = max(0, min(y1, height - 1))
+            x2 = max(0, min(x2, width - 1))
+            y2 = max(0, min(y2, height - 1))
+            
+            if x2 > x1 and y2 > y1:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), red_color, 3)
+                label = f"WEAPON DETECTED ({weapon_cls})"
+                if weapon_score:
+                    label += f" {weapon_score:.2f}"
+                _draw_label_with_background(frame, x1, y1, label, red_color)
     
     return frame
 

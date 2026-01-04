@@ -5,7 +5,8 @@ Detections utilities
 Unified helpers to extract all types of detections from YOLO results.
 This module provides a single, generic method that works for all model types.
 """
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
+import numpy as np
 
 
 def extract_all_detections(result, model_id: str = "", normalize_classes: bool = False) -> Dict[str, Any]:
@@ -22,6 +23,7 @@ def extract_all_detections(result, model_id: str = "", normalize_classes: bool =
     - Class names for each detection
     - Confidence scores for each detection
     - Keypoints (if the model supports pose detection)
+    - Masks (if the model supports segmentation)
     
     Args:
         result: YOLO result object from model inference
@@ -36,6 +38,8 @@ def extract_all_detections(result, model_id: str = "", normalize_classes: bool =
             "scores": [0.95, 0.87, ...],
             "keypoints": [[[x, y, conf], ...], ...],  # One list per person
             "has_keypoints": bool,
+            "masks": [np.ndarray, ...],  # Binary masks for segmentation (one per detection)
+            "has_masks": bool,
             "model_id": str
         }
     """
@@ -46,6 +50,8 @@ def extract_all_detections(result, model_id: str = "", normalize_classes: bool =
         "scores": [],
         "keypoints": [],
         "has_keypoints": False,
+        "masks": [],  # Segmentation masks
+        "has_masks": False,
         "model_id": model_id
     }
     
@@ -136,6 +142,147 @@ def extract_all_detections(result, model_id: str = "", normalize_classes: bool =
                         detections["has_keypoints"] = True
         except Exception:  # noqa: BLE001
             # If keypoint extraction fails, continue without keypoints
+            pass
+    
+    # Step 3: Extract masks (only if model supports segmentation)
+    # Segmentation models have a "masks" attribute
+    masks_attr = getattr(result, "masks", None)
+    if masks_attr is not None:
+        try:
+            # Get original image dimensions
+            if hasattr(result, "orig_shape"):
+                orig_height, orig_width = result.orig_shape[:2]
+            else:
+                # Fallback: try to get from boxes
+                if detections["boxes"]:
+                    max_y = max([box[3] for box in detections["boxes"]])
+                    max_x = max([box[2] for box in detections["boxes"]])
+                    orig_height, orig_width = int(max_y), int(max_x)
+                else:
+                    orig_height, orig_width = 640, 640  # Default fallback
+            
+            # YOLO v8 segmentation: Extract masks from result.masks
+            # Try multiple methods to get masks
+            import cv2
+            
+            masks_extracted = False
+            
+            # Method 1: Try using result.masks.data (tensor format)
+            if hasattr(masks_attr, "data") and masks_attr.data is not None:
+                try:
+                    # Get mask data - convert to numpy if it's a tensor
+                    if hasattr(masks_attr.data, "cpu"):
+                        mask_tensors = masks_attr.data.cpu().numpy()
+                    elif hasattr(masks_attr.data, "numpy"):
+                        mask_tensors = masks_attr.data.numpy()
+                    else:
+                        mask_tensors = np.array(masks_attr.data)
+                    
+                    # Check if we got valid mask data (not all zeros)
+                    if mask_tensors.size > 0 and mask_tensors.max() > 0:
+                        # Process each mask tensor
+                        # Shape is typically (num_masks, mask_height, mask_width)
+                        if len(mask_tensors.shape) == 3:
+                            num_masks = mask_tensors.shape[0]
+                            for mask_idx in range(num_masks):
+                                mask_tensor = mask_tensors[mask_idx]
+                                
+                                # Skip if mask is all zeros
+                                if mask_tensor.max() == 0:
+                                    continue
+                                
+                                # Convert to binary mask (0 or 255)
+                                if mask_tensor.dtype != np.uint8:
+                                    # Normalize and threshold
+                                    if mask_tensor.max() <= 1.0:
+                                        mask_binary = (mask_tensor > 0.5).astype(np.uint8) * 255
+                                    else:
+                                        # Scale to 0-255 range
+                                        mask_normalized = (mask_tensor / mask_tensor.max() * 255).astype(np.uint8)
+                                        mask_binary = (mask_normalized > 127).astype(np.uint8) * 255
+                                else:
+                                    mask_binary = mask_tensor
+                                
+                                # Resize mask to original image dimensions
+                                if mask_binary.shape != (orig_height, orig_width):
+                                    mask_binary = cv2.resize(
+                                        mask_binary, 
+                                        (orig_width, orig_height), 
+                                        interpolation=cv2.INTER_NEAREST
+                                    )
+                                
+                                detections["masks"].append(mask_binary)
+                                detections["has_masks"] = True
+                                masks_extracted = True
+                        
+                        elif len(mask_tensors.shape) == 2:
+                            # Single mask
+                            mask_tensor = mask_tensors
+                            
+                            # Skip if mask is all zeros
+                            if mask_tensor.max() > 0:
+                                # Convert to binary mask
+                                if mask_tensor.dtype != np.uint8:
+                                    if mask_tensor.max() <= 1.0:
+                                        mask_binary = (mask_tensor > 0.5).astype(np.uint8) * 255
+                                    else:
+                                        mask_normalized = (mask_tensor / mask_tensor.max() * 255).astype(np.uint8)
+                                        mask_binary = (mask_normalized > 127).astype(np.uint8) * 255
+                                else:
+                                    mask_binary = mask_tensor
+                                
+                                # Resize to original image dimensions
+                                if mask_binary.shape != (orig_height, orig_width):
+                                    mask_binary = cv2.resize(
+                                        mask_binary, 
+                                        (orig_width, orig_height), 
+                                        interpolation=cv2.INTER_NEAREST
+                                    )
+                                
+                                detections["masks"].append(mask_binary)
+                                detections["has_masks"] = True
+                                masks_extracted = True
+                
+                except Exception as mask_exc:  # noqa: BLE001
+                    # Try alternative method
+                    pass
+            
+            # Method 2: Try using polygon coordinates (result.masks.xy) if data method failed
+            if not masks_extracted and hasattr(masks_attr, "xy") and masks_attr.xy is not None:
+                try:
+                    # Get polygon coordinates
+                    polygons = masks_attr.xy
+                    if hasattr(polygons, "cpu"):
+                        polygons = polygons.cpu().numpy()
+                    elif hasattr(polygons, "numpy"):
+                        polygons = polygons.numpy()
+                    else:
+                        polygons = np.array(polygons)
+                    
+                    # Create binary masks from polygons
+                    for polygon in polygons:
+                        if polygon is None or len(polygon) == 0:
+                            continue
+                        
+                        # Create empty mask
+                        mask_binary = np.zeros((orig_height, orig_width), dtype=np.uint8)
+                        
+                        # Convert polygon to integer coordinates
+                        pts = polygon.reshape(-1, 2).astype(np.int32)
+                        
+                        # Fill polygon in mask
+                        cv2.fillPoly(mask_binary, [pts], 255)
+                        
+                        detections["masks"].append(mask_binary)
+                        detections["has_masks"] = True
+                        masks_extracted = True
+                
+                except Exception:  # noqa: BLE001
+                    pass
+                    
+        except Exception as e:  # noqa: BLE001
+            # If mask extraction fails, continue without masks
+            # This is expected for non-segmentation models
             pass
     
     return detections

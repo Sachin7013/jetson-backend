@@ -37,6 +37,14 @@ def _yolov8m_loader(_name: str) -> Optional[Model]:
         return None
     return YOLO("yolov8m.pt")
 
+@register_model("yolov8m-seg.pt")
+def _yolov8m_seg_loader(_name: str) -> Optional[Model]:
+    if YOLO is None:
+        print("==================================================⚠️ YOLO not available (ultralytics not installed). Skipping detection.==================================================")
+        return None
+    print("==================================================Loading yolov8m-seg.pt==================================================")    
+    return YOLO("yolov8m-seg.pt")    
+
 
 @register_model("yolov8n.pt")
 def _yolov8n_loader(_name: str) -> Optional[Model]:
@@ -68,12 +76,12 @@ def _yolov8s_pose_loader(_name: str) -> Optional[Model]:
         return None
     return YOLO("yolov8s-pose.pt")     
 
-@register_model("yolov8-weapon-detection-1.pt")
+@register_model("epoch150.pt")
 def _yolov8_weapon_detection_1(_name: str) -> Optional[Model]:
     if YOLO is None:
         print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
         return None
     # Load the trained weapon detection model (guns and knives)
-    trained_model_path = r"C:\Model training\runs\detect\guns-knives-detection\weights\best.pt"
+    trained_model_path = r"C:\Users\Manoj\Downloads\epoch150.pt"
     print(f"==================================================Loading weapon detection model from {trained_model_path}==================================================")
     return YOLO(trained_model_path)

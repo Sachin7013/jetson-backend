@@ -170,6 +170,7 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
     model_indices_to_process = []
     for idx, cap in enumerate(model_capabilities):
         model_id = cap.get("model_id", "")
+        print("model_id: ", model_id)
         # Check if this model's capability is in the needed list by comparing model_id
         if model_id in needed_model_ids:
             model_indices_to_process.append(idx)
@@ -270,7 +271,8 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                 merged_classes: List[str] = []
                 merged_scores: List[float] = []
                 merged_keypoints: List[List[List[float]]] = []
-                
+                merged_masks: List[Optional[np.ndarray]] = []
+
                 # Process only models that are needed by the rules (optimization)
                 for model_idx in model_indices_to_process:
                     if model_idx >= len(models):
@@ -292,11 +294,12 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                         # For weapon models, normalize class names to lowercase
                         normalize = "weapon" in model_id.lower()
                         model_detections = extract_all_detections(first_result, model_id=model_id, normalize_classes=normalize)
-                        
+                        print("model_detections: ", model_detections)
                         # Merge into combined detections
                         merged_boxes.extend(model_detections.get("boxes", []))
                         merged_classes.extend(model_detections.get("classes", []))
                         merged_scores.extend(model_detections.get("scores", []))
+                        merged_masks.extend(model_detections.get("masks", []))
                         
                         # Merge keypoints if available
                         if model_detections.get("has_keypoints", False):
@@ -308,6 +311,7 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                     "scores": merged_scores,
                     "boxes": merged_boxes,
                     "keypoints": merged_keypoints,
+                    "masks": merged_masks,
                     "ts": datetime.now(timezone.utc),
                 }
                 
@@ -322,8 +326,8 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                 if shared_store is not None and loaded_rules:
                     try:
                         # Use unified drawing function (handles all rule types automatically)
+                        print("detecttions: ", detections)
                         processed_frame = draw_detections_unified(frame.copy(), detections, loaded_rules)
-                        
                         # Get agent_id from task (use agent_id if available, else use task_id)
                         agent_id = task.get("agent_id") or task_id
                         
@@ -378,7 +382,9 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                         print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 60}")
                     # Make fall detection alerts more prominent
                     elif "fall" in event_label.lower() or "accident" in event_label.lower():
+                        print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 20} FALL DETECTED {'=' * 20}")
                         print(f"[worker {task_id}] 🚨🚨🚨 FALL DETECTED! {event_label} 🚨🚨🚨 | agent='{agent_name}' | video_time={video_ts}")
+                        print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 60}")
                         if event.get("fallen_count"):
                             print(f"[worker {task_id}]    └─ {event.get('fallen_count')} person(s) detected as fallen")
                     else:
@@ -474,7 +480,7 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                     merged_classes: List[str] = []
                     merged_scores: List[float] = []
                     merged_keypoints: List[List[List[float]]] = []
-                    
+                    merged_masks: List[Optional[np.ndarray]] = []
                     # Process only models that are needed by the rules (patrol mode - optimization)
                     for model_idx in model_indices_to_process:
                         if model_idx >= len(models):
@@ -495,11 +501,12 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                             # Use unified extraction (handles all model types)
                             normalize = "weapon" in model_id.lower()
                             model_detections = extract_all_detections(first_result, model_id=model_id, normalize_classes=normalize)
-                            
+                            print("model_detections: ", model_detections)
                             # Merge into combined detections
                             merged_boxes.extend(model_detections.get("boxes", []))
                             merged_classes.extend(model_detections.get("classes", []))
                             merged_scores.extend(model_detections.get("scores", []))
+                            merged_masks.extend(model_detections.get("masks", []))
                             
                             # Merge keypoints if available
                             if model_detections.get("has_keypoints", False):
@@ -510,6 +517,7 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                         "scores": merged_scores,
                         "boxes": merged_boxes,
                         "keypoints": merged_keypoints,
+                        "masks": merged_masks,
                         "ts": datetime.now(timezone.utc),
                     }
                     

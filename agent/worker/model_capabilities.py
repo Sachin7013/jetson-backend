@@ -34,6 +34,7 @@ def detect_model_capabilities(model, model_id: str) -> Dict[str, Any]:
             "model_id": str,
             "has_boxes": bool,        # Can detect objects with boxes
             "has_keypoints": bool,     # Can detect pose keypoints
+            "has_masks": bool,        # Can detect objects with masks
             "detection_type": str,     # "object", "pose", "weapon", etc.
             "likely_classes": List[str] # Common classes this model detects
         }
@@ -45,12 +46,21 @@ def detect_model_capabilities(model, model_id: str) -> Dict[str, Any]:
         "model_id": model_id,
         "has_boxes": True,  # All YOLO models have boxes
         "has_keypoints": False,
-        "detection_type": "object",  # Default to object detection
+        "detection_type": "object", 
+        "has_masks": False, # Can detect objects with masks
         "likely_classes": []
     }
     
+    # Check if it's a segmentation model FIRST (before pose check)
+    # Segmentation models can have "seg" in name but might also have "pose" in structure
+    if "seg" in model_id_lower or "segment" in model_id_lower:
+        capabilities["has_masks"] = True
+        capabilities["detection_type"] = "object"
+        capabilities["likely_classes"] = ["person"]
+        # Segmentation models don't have keypoints, so don't check for pose
+    
     # Check if it's a pose model (by name)
-    if "pose" in model_id_lower:
+    elif "pose" in model_id_lower:
         capabilities["has_keypoints"] = True
         capabilities["detection_type"] = "pose"
         capabilities["likely_classes"] = ["person"]
@@ -60,17 +70,18 @@ def detect_model_capabilities(model, model_id: str) -> Dict[str, Any]:
         capabilities["detection_type"] = "weapon"
         capabilities["likely_classes"] = ["gun", "knife", "weapon"]
     
-    # Try to inspect model structure (if possible)
-    try:
-        # Check if model has keypoint-related attributes
-        if hasattr(model, "model"):
-            model_structure = str(model.model)
-            if "keypoint" in model_structure.lower() or "pose" in model_structure.lower():
-                capabilities["has_keypoints"] = True
-                capabilities["detection_type"] = "pose"
-    except Exception:  # noqa: BLE001
-        # If inspection fails, rely on name-based detection
-        pass
+    # Try to inspect model structure (if possible) - but only if not already detected as segmentation
+    if not capabilities["has_masks"]:
+        try:
+            # Check if model has keypoint-related attributes
+            if hasattr(model, "model"):
+                model_structure = str(model.model)
+                if "keypoint" in model_structure.lower() or "pose" in model_structure.lower():
+                    capabilities["has_keypoints"] = True
+                    capabilities["detection_type"] = "pose"
+        except Exception:  # noqa: BLE001
+            # If inspection fails, rely on name-based detection
+            pass
     
     return capabilities
 
@@ -99,7 +110,7 @@ def get_models_needed_by_rules(
     needs_pose = False
     needs_weapons = False
     needs_objects = False
-    
+    needs_masks = False
     for rule in rules:
         rule_type = str(rule.get("type", "")).lower()
         
@@ -115,21 +126,26 @@ def get_models_needed_by_rules(
         # Most rules need object detection
         if rule_type in ["class_presence", "class_count", "count_at_least"]:
             needs_objects = True
+            needs_masks = True
     
     # Filter models based on needs
     selected_models = []
     
     for model_cap in available_models:
         model_type = model_cap.get("detection_type", "object")
+        has_masks = model_cap.get("has_masks", False)
         
         # Select models that match our needs
         if needs_weapons and model_type == "weapon":
             selected_models.append(model_cap)
         elif needs_pose and model_type == "pose":
             selected_models.append(model_cap)
+        elif needs_masks and has_masks:
+            # If masks are needed, include models with mask capability
+            selected_models.append(model_cap)
         elif needs_objects and model_type == "object":
             selected_models.append(model_cap)
-        elif not (needs_weapons or needs_pose):
+        elif not (needs_weapons or needs_pose or needs_masks):
             # If no specific needs, use all models
             selected_models.append(model_cap)
     

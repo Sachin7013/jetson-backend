@@ -30,6 +30,7 @@ def analyze_rules_for_visualization(rules: List[Dict[str, Any]]) -> Dict[str, An
             "weapon_overlay_classes": Set[str], # Which classes get weapon overlays
             "colors": Dict[str, Tuple[int, int, int]],  # Color scheme
             "label_format": str
+            "draw_person_masks": bool,
         }
     """
     # Start with default configuration
@@ -40,7 +41,8 @@ def analyze_rules_for_visualization(rules: List[Dict[str, Any]]) -> Dict[str, An
         "draw_weapon_overlays": False,
         "weapon_overlay_classes": set(),
         "colors": {},
-        "label_format": "class_score"  # Options: "class", "class_score", "custom"
+        "label_format": "class_score",  # Options: "class", "class_score", "custom"
+        "draw_person_masks": False,
     }
     
     if not rules:
@@ -55,19 +57,39 @@ def analyze_rules_for_visualization(rules: List[Dict[str, Any]]) -> Dict[str, An
             config["draw_weapon_overlays"] = True
             config["draw_boxes"] = True
             
-            # Get weapon class from rule
-            weapon_class = str(rule.get("class", "")).lower()
+            # Get weapon class from rule - filter based on specific weapon type requested
+            weapon_class = str(rule.get("class", "")).lower().strip()
             if weapon_class:
-                # Add weapon variations
-                if weapon_class == "gun":
-                    config["weapon_overlay_classes"].update(["gun", "guns", "pistol", "rifle", "weapon"])
-                elif weapon_class == "knife":
-                    config["weapon_overlay_classes"].update(["knife", "knives", "knif", "blade"])
-                else:
-                    config["weapon_overlay_classes"].add(weapon_class)
+                # Define weapon variations (matching weapon_detection.py logic)
+                weapon_classes = {
+                    "gun": ["gun", "guns", "pistol", "rifle","1"],
+                    "knife": ["knife", "knives", "knif", "blade"]
+                }
                 
-                # Also draw boxes for weapons
-                config["box_classes"].update(config["weapon_overlay_classes"])
+                # Get target weapon classes based on the rule_class specified
+                # Only add the specific weapon type requested, not all weapons
+                target_weapon_classes = []
+                
+                # Check if weapon_class matches a known weapon type
+                if weapon_class in weapon_classes:
+                    # Use the variations for this specific weapon type only
+                    target_weapon_classes = weapon_classes[weapon_class]
+                else:
+                    # Check if weapon_class is one of the variations
+                    for weapon_type, variations in weapon_classes.items():
+                        if weapon_class in variations:
+                            target_weapon_classes = variations
+                            break
+                    
+                    # If no match found, use weapon_class directly (fallback)
+                    if not target_weapon_classes:
+                        target_weapon_classes = [weapon_class]
+                
+                # Add only the specific weapon type variations to overlay classes
+                config["weapon_overlay_classes"].update(target_weapon_classes)
+                
+                # Also draw boxes for weapons (only the specified type)
+                config["box_classes"].update(target_weapon_classes)
             
             # Always draw person boxes for weapon detection (to show armed persons)
             config["box_classes"].add("person")
@@ -80,6 +102,7 @@ def analyze_rules_for_visualization(rules: List[Dict[str, Any]]) -> Dict[str, An
         
         # Class presence/count rules need boxes for those classes
         elif rule_type in ["class_presence", "class_count", "count_at_least"]:
+            config["draw_person_masks"] = True
             config["draw_boxes"] = True
             
             # Get classes from rule (support both "class" and "classes" formats)
@@ -99,9 +122,10 @@ def analyze_rules_for_visualization(rules: List[Dict[str, Any]]) -> Dict[str, An
     config["colors"] = {
         "default": (0, 255, 0),      # Green for regular detections
         "weapon": (0, 0, 255),       # Red for weapons
-        "person": (0, 255, 255),     # Yellow for persons
-        "keypoint": (0, 255, 255),   # Yellow for keypoints
+        "person": (0, 255, 0),     # Yellow for persons
+        "keypoint": (0, 165, 255),   # Orange for keypoints
         "keypoint_line": (0, 255, 0), # Green for keypoint skeleton lines
+        "person_mask": (0, 255, 255), # Yellow for person masks
     }
     
     return config
