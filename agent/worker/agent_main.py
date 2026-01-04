@@ -16,7 +16,7 @@ import time
 import os
 import sys
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 
 from bson import ObjectId
 try:
@@ -37,7 +37,13 @@ from agent.rule_engine.engine import evaluate_rules
 from agent.worker.video_io import open_video_capture
 from agent.worker.detections import extract_all_detections
 from agent.worker.frame_hub import reconstruct_frame
-from agent.worker.frame_processor import draw_detections_unified, filter_detections_by_zone
+from agent.worker.frame_processor import draw_detections_unified
+from agent.worker.zone_processor import (
+    filter_detections_by_zone,
+    extract_target_classes_from_rules,
+    get_objects_in_zone,
+    detect_zone_enter_exit
+)
 from agent.worker.model_capabilities import detect_model_capabilities, get_models_needed_by_rules
 import numpy as np
 
@@ -157,6 +163,10 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
 
     # Load rules ONCE at startup (do not refetch per frame)
     loaded_rules: List[Dict[str, any]] = task.get("rules") or []
+    
+    # Initialize zone tracking state (for enter/exit detection)
+    # Track objects currently in zone using object IDs
+    zone_tracking_state: Set[str] = set()  # Set of object IDs currently in zone
 
     # Optimize: Determine which models are actually needed based on rules
     # This saves computation by only processing relevant models
@@ -327,11 +337,65 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                         # Get frame dimensions
                         frame_height, frame_width = frame.shape[:2]
                         
+                        # Extract target classes from rules (generic - works for any class)
+                        target_classes = extract_target_classes_from_rules(loaded_rules)
+                        
+                        # Get objects currently in zone (BEFORE filtering) for enter/exit tracking
+                        current_objects_in_zone = get_objects_in_zone(
+                            detections,
+                            zone_coordinates,
+                            frame_height,
+                            frame_width,
+                            target_classes=target_classes if target_classes else None
+                        )
+                        
+                        # Detect enter/exit events by comparing with previous state
+                        current_time = datetime.now(timezone.utc)
+                        enter_exit_events = detect_zone_enter_exit(
+                            current_objects_in_zone,
+                            zone_tracking_state,
+                            current_time
+                        )
+                        
+                        # Trigger alerts for enter events
+                        for enter_event in enter_exit_events.get("entered", []):
+                            obj_class = enter_event.get("class", "unknown")
+                            enter_time = enter_event.get("enter_time")
+                            agent_id = task.get("agent_id") or task_id
+                            camera_id = task.get("camera_id", "")
+                            
+                            print(f"[worker {task_id}] 🚨 ENTER ALERT: {obj_class} entered restricted zone!")
+                            print(f"[worker {task_id}]    └─ Agent: {agent_id} | Camera: {camera_id} | Class: {obj_class} | Enter Time: {enter_time}")
+                            # TODO: Store in DB when DB service is ready
+                            # Store: agent_id, camera_id, class, enter_time, event_type="enter"
+                        
+                        # Trigger alerts for exit events
+                        for exit_event in enter_exit_events.get("exited", []):
+                            obj_class = exit_event.get("class", "unknown")
+                            exit_time = exit_event.get("exit_time")
+                            agent_id = task.get("agent_id") or task_id
+                            camera_id = task.get("camera_id", "")
+                            
+                            print(f"[worker {task_id}] 🚨 EXIT ALERT: {obj_class} exited restricted zone!")
+                            print(f"[worker {task_id}]    └─ Agent: {agent_id} | Camera: {camera_id} | Class: {obj_class} | Exit Time: {exit_time}")
+                            # TODO: Store in DB when DB service is ready
+                            # Store: agent_id, camera_id, class, exit_time, event_type="exit"
+                        
+                        # Update tracking state for next frame
+                        zone_tracking_state = current_objects_in_zone
+                        
                         # Count detections before filtering
                         detections_before = len(detections.get("classes", []))
                         
                         # Filter detections to only include objects inside the zone
-                        detections = filter_detections_by_zone(detections, zone_coordinates, frame_height, frame_width)
+                        # Only filter for classes specified in rules (generic approach)
+                        detections = filter_detections_by_zone(
+                            detections, 
+                            zone_coordinates, 
+                            frame_height, 
+                            frame_width,
+                            target_classes=target_classes if target_classes else None
+                        )
                         
                         # Count detections after filtering
                         detections_after = len(detections.get("classes", []))
@@ -561,11 +625,63 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                             # Get frame dimensions
                             frame_height, frame_width = frame.shape[:2]
                             
+                            # Extract target classes from rules (generic - works for any class)
+                            target_classes = extract_target_classes_from_rules(loaded_rules)
+                            
+                            # Get objects currently in zone (BEFORE filtering) for enter/exit tracking
+                            current_objects_in_zone = get_objects_in_zone(
+                                detections,
+                                zone_coordinates,
+                                frame_height,
+                                frame_width,
+                                target_classes=target_classes if target_classes else None
+                            )
+                            
+                            # Detect enter/exit events by comparing with previous state
+                            current_time = datetime.now(timezone.utc)
+                            enter_exit_events = detect_zone_enter_exit(
+                                current_objects_in_zone,
+                                zone_tracking_state,
+                                current_time
+                            )
+                            
+                            # Trigger alerts for enter events
+                            for enter_event in enter_exit_events.get("entered", []):
+                                obj_class = enter_event.get("class", "unknown")
+                                enter_time = enter_event.get("enter_time")
+                                agent_id = task.get("agent_id") or task_id
+                                camera_id = task.get("camera_id", "")
+                                
+                                print(f"[worker {task_id}] 🚨 ENTER ALERT: {obj_class} entered restricted zone!")
+                                print(f"[worker {task_id}]    └─ Agent: {agent_id} | Camera: {camera_id} | Class: {obj_class} | Enter Time: {enter_time}")
+                                # TODO: Store in DB when DB service is ready
+                            
+                            # Trigger alerts for exit events
+                            for exit_event in enter_exit_events.get("exited", []):
+                                obj_class = exit_event.get("class", "unknown")
+                                exit_time = exit_event.get("exit_time")
+                                agent_id = task.get("agent_id") or task_id
+                                camera_id = task.get("camera_id", "")
+                                
+                                print(f"[worker {task_id}] 🚨 EXIT ALERT: {obj_class} exited restricted zone!")
+                                print(f"[worker {task_id}]    └─ Agent: {agent_id} | Camera: {camera_id} | Class: {obj_class} | Exit Time: {exit_time}")
+                                # TODO: Store in DB when DB service is ready
+                            
+                            # Update tracking state for next frame
+                            zone_tracking_state = current_objects_in_zone
+                            
                             # Count detections before filtering
                             detections_before = len(detections.get("classes", []))
                             
                             # Filter detections to only include objects inside the zone
-                            detections = filter_detections_by_zone(detections, zone_coordinates, frame_height, frame_width)
+                            # Only filter for classes specified in rules (generic approach)
+                            detections = filter_detections_by_zone(
+                                detections, 
+                                zone_coordinates, 
+                                frame_height, 
+                                frame_width,
+                                target_classes=target_classes if target_classes else None
+                            )
                             
                             # Count detections after filtering
                             detections_after = len(detections.get("classes", []))
