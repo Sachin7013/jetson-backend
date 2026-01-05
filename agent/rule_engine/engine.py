@@ -24,9 +24,9 @@ from agent.rule_engine.registry import rules_registry
 from agent.rule_engine import rule_types  # noqa: F401
 
 
-def evaluate_rules(rules: List[Dict[str, Any]], detections: Dict[str, Any], task: Dict[str, Any], state: Dict[int, Dict[str, Any]], now: datetime) -> Optional[Dict[str, Any]]:
+def evaluate_rules(rules: List[Dict[str, Any]], detections: Dict[str, Any], task: Dict[str, Any], state: Dict[int, Dict[str, Any]], now: datetime) -> Optional[List[Dict[str, Any]]]:
     """
-    Evaluate a list of rules (first match wins).
+    Evaluate a list of rules and return all matching results.
 
     - rules: list of rule dicts (loaded once at worker start)
     - detections: {'classes': [...], 'scores': [...], 'boxes': [...], 'ts': datetime}
@@ -35,11 +35,13 @@ def evaluate_rules(rules: List[Dict[str, Any]], detections: Dict[str, Any], task
     - now: current timestamp
 
     Returns:
-      dict {'label': str, 'rule_index': int} or None
+      List of dicts [{'label': str, 'rule_index': int, ...}, ...] or None if no matches
     """
     # Print all registered rule types before evaluating
     print(f"[evaluate_rules] Registered rules: {list(rules_registry.keys())}")
     print(f"[evaluate_rules] rules: {rules}")
+    
+    all_results = []
     for rule_index, rule in enumerate(rules or []):
         print(f"[evaluate_rules] rule: {rule}")
         rule_type = (rule.get("type") or "").strip().lower()
@@ -52,7 +54,11 @@ def evaluate_rules(rules: List[Dict[str, Any]], detections: Dict[str, Any], task
         if evaluation_result and isinstance(evaluation_result, dict) and evaluation_result.get("label"):
             # Ensure rule_index is set
             evaluation_result.setdefault("rule_index", rule_index)
-            return evaluation_result
-    return None
+            print(f"[evaluate_rules] evaluation_result: {evaluation_result}")
+            all_results.append(evaluation_result)
+
+    print(f"[evaluate_rules] all_results: {all_results}")
+    print(f"[evaluate_rules] returning all_results: len(all_results): {len(all_results)}")
+    return all_results if all_results else None
 
 

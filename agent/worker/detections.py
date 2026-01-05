@@ -4,31 +4,81 @@ Detections utilities
 
 Unified helpers to extract all types of detections from YOLO results.
 This module provides a single, generic method that works for all model types.
+
+Confidence Thresholds:
+- General objects: confidence >= 0.7 (reduces false positives)
+- Weapons: confidence >= 0.5 (weapons are harder to detect, need lower threshold)
+- Lower confidence detections are filtered out
 """
 from typing import List, Tuple, Dict, Any, Optional
 import numpy as np
 
+# General confidence threshold: Only keep detections with confidence >= 0.7
+# This helps reduce false positives (incorrect detections)
+# Value range: 0.0 (accept all) to 1.0 (very strict)
+CONFIDENCE_THRESHOLD = 0.7
 
-def extract_all_detections(result, model_id: str = "", normalize_classes: bool = False) -> Dict[str, Any]:
+# Weapon detection confidence threshold: Only keep weapon detections with confidence >= 0.5
+# Weapons are harder to detect, so we use a lower threshold to catch more weapon detections
+# This helps identify weapons that might be missed with the higher general threshold
+WEAPON_DETECTION_CONFIDENCE_THRESHOLD = 0.5
+
+# List of weapon class names (all variations)
+# These classes will use the lower weapon threshold (0.5) instead of general threshold (0.7)
+WEAPON_CLASSES = [
+    "gun", "guns", "pistol", "rifle", "1",  # Gun variations
+    "knife", "knives", "knif", "blade",     # Knife variations
+    "weapon", "weapons"                      # General weapon terms
+]
+
+
+def is_weapon_class(class_name: str) -> bool:
+    """
+    Check if a class name is a weapon class.
+    
+    This function checks if the given class name matches any weapon class
+    (gun, knife, pistol, rifle, blade, etc.) so we can use a lower confidence
+    threshold for weapons.
+    
+    Args:
+        class_name: The class name to check (case-insensitive)
+    
+    Returns:
+        True if the class is a weapon, False otherwise
+    """
+    if not class_name:
+        return False
+    
+    class_name_lower = str(class_name).lower().strip()
+    
+    # Check if class name matches any weapon class
+    for weapon_class in WEAPON_CLASSES:
+        weapon_class_lower = weapon_class.lower()
+        # Exact match or contains check
+        if weapon_class_lower == class_name_lower or weapon_class_lower in class_name_lower or class_name_lower in weapon_class_lower:
+            return True
+    
+    return False
+
+
+def extract_all_detections(result, model_id: str = "") -> Dict[str, Any]:
     """
     Unified method to extract ALL types of detections from any YOLO result.
     
-    This single method replaces the old rule-specific methods:
-    - extract_detections_from_result
-    - extract_keypoints_from_result  
-    - extract_detections_from_weapon_result
+    This is the unified method for extracting all types of detections from YOLO results.
     
     What it extracts:
     - Bounding boxes (x1, y1, x2, y2) for all detected objects
-    - Class names for each detection
+    - Class names for each detection (original case, not normalized)
     - Confidence scores for each detection
     - Keypoints (if the model supports pose detection)
     - Masks (if the model supports segmentation)
     
+    Note: Class names are kept in original case. Rules normalize classes internally if needed.
+    
     Args:
         result: YOLO result object from model inference
         model_id: Optional model identifier (for debugging)
-        normalize_classes: If True, convert class names to lowercase
     
     Returns:
         Dictionary with:
@@ -72,30 +122,37 @@ def extract_all_detections(result, model_id: str = "", normalize_classes: bool =
             conf_list = result.boxes.conf.tolist() if hasattr(result.boxes, "conf") else []
             
             # Convert each detection to our format
+            # We'll filter by confidence threshold based on class type (weapon vs general)
             for detection_index, box in enumerate(xyxy):
-                # Box coordinates: [x1, y1, x2, y2]
-                detections["boxes"].append([
-                    float(box[0]), 
-                    float(box[1]), 
-                    float(box[2]), 
-                    float(box[3])
-                ])
-                
-                # Class name
+                # Get class name first (we need this to determine which threshold to use)
                 class_id = int(cls_list[detection_index]) if detection_index < len(cls_list) else -1
-                class_name = class_names_by_id.get(class_id, str(class_id))
+                class_name = str(class_names_by_id.get(class_id, str(class_id)))
                 
-                # Normalize class name if requested (useful for weapon detection)
-                if normalize_classes:
-                    class_name = str(class_name).lower()
-                else:
-                    class_name = str(class_name)
-                
-                detections["classes"].append(class_name)
-                
-                # Confidence score
+                # Get confidence score
                 score = float(conf_list[detection_index]) if detection_index < len(conf_list) else 0.0
-                detections["scores"].append(score)
+                
+                # IMPORTANT: Use different confidence thresholds based on class type
+                # - Weapons: Use lower threshold (0.5) because they're harder to detect
+                # - Other objects: Use higher threshold (0.7) to reduce false positives
+                is_weapon = is_weapon_class(class_name)
+                required_threshold = WEAPON_DETECTION_CONFIDENCE_THRESHOLD if is_weapon else CONFIDENCE_THRESHOLD
+                
+                # Only add detection if confidence score meets the required threshold
+                if score >= required_threshold:
+                    # Box coordinates: [x1, y1, x2, y2]
+                    detections["boxes"].append([
+                        float(box[0]), 
+                        float(box[1]), 
+                        float(box[2]), 
+                        float(box[3])
+                    ])
+                    
+                    # Class name (keep original case - rules normalize internally if needed)
+                    detections["classes"].append(class_name)
+                    
+                    # Confidence score (already checked above, but store it)
+                    detections["scores"].append(score)
+                # If confidence < threshold, we skip this detection (don't add it to any list)
                 
         except Exception:  # noqa: BLE001
             # If extraction fails, continue with empty boxes (keypoints might still work)
@@ -103,14 +160,36 @@ def extract_all_detections(result, model_id: str = "", normalize_classes: bool =
     
     # Step 2: Extract keypoints (only if model supports pose detection)
     # Pose models have a "keypoints" attribute
+    # NOTE: Keypoints should align with boxes - we only keep keypoints for boxes that passed confidence threshold
     kp = getattr(result, "keypoints", None)
     if kp is not None:
         try:
+            # Get the original confidence scores and class names to match keypoints with boxes
+            # We need to know which boxes passed the confidence threshold (weapon vs general)
+            original_conf_list = result.boxes.conf.tolist() if hasattr(result, "boxes") and hasattr(result.boxes, "conf") else []
+            original_cls_list = result.boxes.cls.tolist() if hasattr(result, "boxes") and hasattr(result.boxes, "cls") else []
+            class_names_by_id = result.names if hasattr(result, "names") else {}
+            
             # Try to get keypoints data
             if hasattr(kp, "data") and kp.data is not None:
                 # Format: data contains [x, y, confidence] for each keypoint
                 data = kp.data.tolist()
-                for person in data:
+                for person_index, person in enumerate(data):
+                    # Check if this person's box passed the confidence threshold
+                    # Keypoints align with boxes by index
+                    if person_index < len(original_conf_list):
+                        person_confidence = float(original_conf_list[person_index])
+                        
+                        # Get class name to determine which threshold to use
+                        class_id = int(original_cls_list[person_index]) if person_index < len(original_cls_list) else -1
+                        class_name = str(class_names_by_id.get(class_id, str(class_id)))
+                        is_weapon = is_weapon_class(class_name)
+                        required_threshold = WEAPON_DETECTION_CONFIDENCE_THRESHOLD if is_weapon else CONFIDENCE_THRESHOLD
+                        
+                        # Only extract keypoints if the corresponding box passed confidence threshold
+                        if person_confidence < required_threshold:
+                            continue  # Skip this person's keypoints
+                    
                     person_keypoints: List[List[float]] = []
                     for pt in person:
                         if pt is None or len(pt) < 2:
@@ -131,7 +210,25 @@ def extract_all_detections(result, model_id: str = "", normalize_classes: bool =
             elif hasattr(kp, "xy") and kp.xy is not None:
                 # Alternative format: just [x, y] coordinates
                 xy = kp.xy.tolist()
-                for person in xy:
+                original_conf_list = result.boxes.conf.tolist() if hasattr(result, "boxes") and hasattr(result.boxes, "conf") else []
+                original_cls_list = result.boxes.cls.tolist() if hasattr(result, "boxes") and hasattr(result.boxes, "cls") else []
+                class_names_by_id = result.names if hasattr(result, "names") else {}
+                
+                for person_index, person in enumerate(xy):
+                    # Check if this person's box passed the confidence threshold
+                    if person_index < len(original_conf_list):
+                        person_confidence = float(original_conf_list[person_index])
+                        
+                        # Get class name to determine which threshold to use
+                        class_id = int(original_cls_list[person_index]) if person_index < len(original_cls_list) else -1
+                        class_name = str(class_names_by_id.get(class_id, str(class_id)))
+                        is_weapon = is_weapon_class(class_name)
+                        required_threshold = WEAPON_DETECTION_CONFIDENCE_THRESHOLD if is_weapon else CONFIDENCE_THRESHOLD
+                        
+                        # Only extract keypoints if the corresponding box passed confidence threshold
+                        if person_confidence < required_threshold:
+                            continue  # Skip this person's keypoints
+                    
                     person_keypoints = [
                         [float(p[0]), float(p[1])] 
                         for p in person 
@@ -146,9 +243,16 @@ def extract_all_detections(result, model_id: str = "", normalize_classes: bool =
     
     # Step 3: Extract masks (only if model supports segmentation)
     # Segmentation models have a "masks" attribute
+    # NOTE: Masks should align with boxes - we only keep masks for boxes that passed confidence threshold
     masks_attr = getattr(result, "masks", None)
     if masks_attr is not None:
         try:
+            # Get original confidence scores and class names to match masks with boxes
+            # We need to know which boxes passed the confidence threshold (weapon vs general)
+            original_conf_list = result.boxes.conf.tolist() if hasattr(result, "boxes") and hasattr(result.boxes, "conf") else []
+            original_cls_list = result.boxes.cls.tolist() if hasattr(result, "boxes") and hasattr(result.boxes, "cls") else []
+            class_names_by_id = result.names if hasattr(result, "names") else {}
+            
             # Get original image dimensions
             if hasattr(result, "orig_shape"):
                 orig_height, orig_width = result.orig_shape[:2]
@@ -185,6 +289,21 @@ def extract_all_detections(result, model_id: str = "", normalize_classes: bool =
                         if len(mask_tensors.shape) == 3:
                             num_masks = mask_tensors.shape[0]
                             for mask_idx in range(num_masks):
+                                # Check if this mask's box passed the confidence threshold
+                                # Masks align with boxes by index
+                                if mask_idx < len(original_conf_list):
+                                    mask_confidence = float(original_conf_list[mask_idx])
+                                    
+                                    # Get class name to determine which threshold to use
+                                    class_id = int(original_cls_list[mask_idx]) if mask_idx < len(original_cls_list) else -1
+                                    class_name = str(class_names_by_id.get(class_id, str(class_id)))
+                                    is_weapon = is_weapon_class(class_name)
+                                    required_threshold = WEAPON_DETECTION_CONFIDENCE_THRESHOLD if is_weapon else CONFIDENCE_THRESHOLD
+                                    
+                                    # Only extract mask if the corresponding box passed confidence threshold
+                                    if mask_confidence < required_threshold:
+                                        continue  # Skip this mask
+                                
                                 mask_tensor = mask_tensors[mask_idx]
                                 
                                 # Skip if mask is all zeros
@@ -216,32 +335,72 @@ def extract_all_detections(result, model_id: str = "", normalize_classes: bool =
                                 masks_extracted = True
                         
                         elif len(mask_tensors.shape) == 2:
-                            # Single mask
-                            mask_tensor = mask_tensors
-                            
-                            # Skip if mask is all zeros
-                            if mask_tensor.max() > 0:
-                                # Convert to binary mask
-                                if mask_tensor.dtype != np.uint8:
-                                    if mask_tensor.max() <= 1.0:
-                                        mask_binary = (mask_tensor > 0.5).astype(np.uint8) * 255
-                                    else:
-                                        mask_normalized = (mask_tensor / mask_tensor.max() * 255).astype(np.uint8)
-                                        mask_binary = (mask_normalized > 127).astype(np.uint8) * 255
+                            # Single mask - check confidence if we have boxes
+                            if len(original_conf_list) > 0:
+                                mask_confidence = float(original_conf_list[0])
+                                
+                                # Get class name to determine which threshold to use
+                                class_id = int(original_cls_list[0]) if len(original_cls_list) > 0 else -1
+                                class_name = str(class_names_by_id.get(class_id, str(class_id)))
+                                is_weapon = is_weapon_class(class_name)
+                                required_threshold = WEAPON_DETECTION_CONFIDENCE_THRESHOLD if is_weapon else CONFIDENCE_THRESHOLD
+                                
+                                # Only extract mask if the corresponding box passed confidence threshold
+                                if mask_confidence < required_threshold:
+                                    pass  # Skip this mask
                                 else:
-                                    mask_binary = mask_tensor
+                                    mask_tensor = mask_tensors
+                                    
+                                    # Skip if mask is all zeros
+                                    if mask_tensor.max() > 0:
+                                        # Convert to binary mask
+                                        if mask_tensor.dtype != np.uint8:
+                                            if mask_tensor.max() <= 1.0:
+                                                mask_binary = (mask_tensor > 0.5).astype(np.uint8) * 255
+                                            else:
+                                                mask_normalized = (mask_tensor / mask_tensor.max() * 255).astype(np.uint8)
+                                                mask_binary = (mask_normalized > 127).astype(np.uint8) * 255
+                                        else:
+                                            mask_binary = mask_tensor
+                                        
+                                        # Resize to original image dimensions
+                                        if mask_binary.shape != (orig_height, orig_width):
+                                            mask_binary = cv2.resize(
+                                                mask_binary, 
+                                                (orig_width, orig_height), 
+                                                interpolation=cv2.INTER_NEAREST
+                                            )
+                                        
+                                        detections["masks"].append(mask_binary)
+                                        detections["has_masks"] = True
+                                        masks_extracted = True
+                            else:
+                                # No confidence info, extract mask anyway (fallback)
+                                mask_tensor = mask_tensors
                                 
-                                # Resize to original image dimensions
-                                if mask_binary.shape != (orig_height, orig_width):
-                                    mask_binary = cv2.resize(
-                                        mask_binary, 
-                                        (orig_width, orig_height), 
-                                        interpolation=cv2.INTER_NEAREST
-                                    )
-                                
-                                detections["masks"].append(mask_binary)
-                                detections["has_masks"] = True
-                                masks_extracted = True
+                                # Skip if mask is all zeros
+                                if mask_tensor.max() > 0:
+                                    # Convert to binary mask
+                                    if mask_tensor.dtype != np.uint8:
+                                        if mask_tensor.max() <= 1.0:
+                                            mask_binary = (mask_tensor > 0.5).astype(np.uint8) * 255
+                                        else:
+                                            mask_normalized = (mask_tensor / mask_tensor.max() * 255).astype(np.uint8)
+                                            mask_binary = (mask_normalized > 127).astype(np.uint8) * 255
+                                    else:
+                                        mask_binary = mask_tensor
+                                    
+                                    # Resize to original image dimensions
+                                    if mask_binary.shape != (orig_height, orig_width):
+                                        mask_binary = cv2.resize(
+                                            mask_binary, 
+                                            (orig_width, orig_height), 
+                                            interpolation=cv2.INTER_NEAREST
+                                        )
+                                    
+                                    detections["masks"].append(mask_binary)
+                                    detections["has_masks"] = True
+                                    masks_extracted = True
                 
                 except Exception as mask_exc:  # noqa: BLE001
                     # Try alternative method
@@ -260,7 +419,22 @@ def extract_all_detections(result, model_id: str = "", normalize_classes: bool =
                         polygons = np.array(polygons)
                     
                     # Create binary masks from polygons
-                    for polygon in polygons:
+                    # Only keep masks for boxes that passed confidence threshold
+                    for polygon_index, polygon in enumerate(polygons):
+                        # Check if this mask's box passed the confidence threshold
+                        if polygon_index < len(original_conf_list):
+                            polygon_confidence = float(original_conf_list[polygon_index])
+                            
+                            # Get class name to determine which threshold to use
+                            class_id = int(original_cls_list[polygon_index]) if polygon_index < len(original_cls_list) else -1
+                            class_name = str(class_names_by_id.get(class_id, str(class_id)))
+                            is_weapon = is_weapon_class(class_name)
+                            required_threshold = WEAPON_DETECTION_CONFIDENCE_THRESHOLD if is_weapon else CONFIDENCE_THRESHOLD
+                            
+                            # Only extract mask if the corresponding box passed confidence threshold
+                            if polygon_confidence < required_threshold:
+                                continue  # Skip this mask
+                        
                         if polygon is None or len(polygon) == 0:
                             continue
                         
@@ -285,36 +459,16 @@ def extract_all_detections(result, model_id: str = "", normalize_classes: bool =
             # This is expected for non-segmentation models
             pass
     
+    # Summary: All detections have been filtered by confidence threshold
+    # - Weapons: Use lower threshold (>= 0.5) because they're harder to detect
+    # - Other objects: Use higher threshold (>= 0.7) to reduce false positives
+    # - Boxes, classes, and scores: Filtered during extraction (Step 1) using appropriate threshold
+    # - Keypoints: Only extracted for boxes that passed confidence threshold (Step 2)
+    # - Masks: Only extracted for boxes that passed confidence threshold (Step 3)
+    # All arrays (boxes, classes, scores, keypoints, masks) are aligned and filtered consistently
+    
     return detections
 
 
 
 
-
-#================================================================================================
-# Keep old methods for backward compatibility (deprecated)
-def extract_detections_from_result(result) -> Tuple[List[List[float]], List[str], List[float]]:
-    """
-    DEPRECATED: Use extract_all_detections() instead.
-    Kept for backward compatibility.
-    """
-    detections = extract_all_detections(result)
-    return detections["boxes"], detections["classes"], detections["scores"]
-
-
-def extract_keypoints_from_result(result) -> List[List[List[float]]]:
-    """
-    DEPRECATED: Use extract_all_detections() instead.
-    Kept for backward compatibility.
-    """
-    detections = extract_all_detections(result)
-    return detections["keypoints"]
-
-
-def extract_detections_from_weapon_result(result) -> Tuple[List[List[float]], List[str], List[float]]:
-    """
-    DEPRECATED: Use extract_all_detections(result, normalize_classes=True) instead.
-    Kept for backward compatibility.
-    """
-    detections = extract_all_detections(result, normalize_classes=True)
-    return detections["boxes"], detections["classes"], detections["scores"]

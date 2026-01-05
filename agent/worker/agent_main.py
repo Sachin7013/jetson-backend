@@ -44,7 +44,10 @@ from agent.worker.zone_processor import (
     get_objects_in_zone,
     detect_zone_enter_exit
 )
-from agent.worker.model_capabilities import detect_model_capabilities, get_models_needed_by_rules
+from agent.worker.model_capabilities import (
+    detect_model_capabilities, 
+    get_models_needed_by_rules
+)
 import numpy as np
 
 
@@ -135,7 +138,7 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
             # Detect what this model can do
             capabilities = detect_model_capabilities(model_instance, model_id)
             model_capabilities.append(capabilities)
-            print(f"[worker {task_id}] ✅ Model loaded: {model_id} | type={capabilities['detection_type']} | keypoints={capabilities['has_keypoints']}")
+            print(f"[worker {task_id}] ✅ Model loaded: {model_id} | type={capabilities['detection_type']} | keypoints={capabilities['has_keypoints']} | weapons={capabilities['has_weapons']} | masks={capabilities['has_masks']}")
         else:
             print(f"[worker {task_id}] ⚠️ Failed to load model: {model_id}")
     if not models:
@@ -171,6 +174,8 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
     # Optimize: Determine which models are actually needed based on rules
     # This saves computation by only processing relevant models
     needed_model_capabilities = get_models_needed_by_rules(loaded_rules, model_capabilities)
+
+    print("needed_model_capabilities length: ", len(needed_model_capabilities))
     
     # Create a set of model IDs that are needed (for fast lookup)
     needed_model_ids = {cap.get("model_id", "") for cap in needed_model_capabilities}
@@ -299,12 +304,9 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                         first_result = results[0]
                         # Get model ID for this model
                         model_id = model_ids[model_idx] if model_idx < len(model_ids) else ""
-                        
                         # Use unified extraction (handles all model types)
-                        # For weapon models, normalize class names to lowercase
-                        normalize = "weapon" in model_id.lower()
-                        model_detections = extract_all_detections(first_result, model_id=model_id, normalize_classes=normalize)
-                        print("model_detections: ", model_detections)
+                        # Rules handle class normalization internally if needed
+                        model_detections = extract_all_detections(first_result, model_id=model_id)
                         # Merge into combined detections
                         merged_boxes.extend(model_detections.get("boxes", []))
                         merged_classes.extend(model_detections.get("classes", []))
@@ -339,6 +341,7 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                         
                         # Extract target classes from rules (generic - works for any class)
                         target_classes = extract_target_classes_from_rules(loaded_rules)
+                        print(f"[worker {task_id}] 🔍 target_classes extracted from rules: {target_classes}")
                         
                         # Get objects currently in zone (BEFORE filtering) for enter/exit tracking
                         current_objects_in_zone = get_objects_in_zone(
@@ -386,6 +389,8 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                         
                         # Count detections before filtering
                         detections_before = len(detections.get("classes", []))
+                        detections_before_classes = detections.get("classes", [])
+                        print(f"[worker {task_id}] 🔍 Detections BEFORE zone filtering: {detections_before} objects, classes: {detections_before_classes}")
                         
                         # Filter detections to only include objects inside the zone
                         # Only filter for classes specified in rules (generic approach)
@@ -399,6 +404,8 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                         
                         # Count detections after filtering
                         detections_after = len(detections.get("classes", []))
+                        detections_after_classes = detections.get("classes", [])
+                        print(f"[worker {task_id}] 🔍 Detections AFTER zone filtering: {detections_after} objects, classes: {detections_after_classes}")
                         
                         # If any objects were detected in the restricted zone, log it
                         if detections_after > 0:
@@ -449,40 +456,42 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                         print(f"[worker {task_id}] ⚠️  Error processing frame for stream: {exc}")
 
                 # Prefer new rule engine if rules are provided; else fallback
-                event = None
+                events = None
                 if loaded_rules:
                     # Debug: log rules and detections (first frame only, then every 30 frames)
                     if frame_index == 1 or frame_index % 30 == 0:
                         print(f"[worker {task_id}] 🔍 Rules: {loaded_rules}")
                         print(f"[worker {task_id}] 🔍 Detected classes: {merged_classes[:5]}")  # First 5 only
-                    event = evaluate_rules(loaded_rules, detections, task, rule_state, detections["ts"])
+                    events = evaluate_rules(loaded_rules, detections, task, rule_state, detections["ts"])
                 else:
                     # compatibility path
                     label = check_event_match(task, merged_classes)
-                    event = {"label": label} if label else None
+                    events = [{"label": label}] if label else None
 
                 video_ms = get_video_time_ms(video_capture, frame_index, fps) if not use_hub else (frame_index / float(max(1, fps))) * 1000.0
                 video_ts = format_video_time_ms(video_ms)
 
-                if event and event.get("label"):
-                    event_label = str(event["label"]).strip()
-                    # Make weapon detection alerts more prominent
-                    if any(keyword in event_label.lower() for keyword in ["gun detected", "knife detected", "weapon detected"]):
-                        weapon_label = event_label.upper()
-                        print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 20} WEAPON DETECTED {'=' * 20}")
-                        print(f"[worker {task_id}] 🚨🚨🚨 {weapon_label} 🚨🚨🚨 | agent='{agent_name}' | video_time={video_ts}")
-                        print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 60}")
-                    # Make fall detection alerts more prominent
-                    elif "fall" in event_label.lower() or "accident" in event_label.lower():
-                        print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 20} FALL DETECTED {'=' * 20}")
-                        print(f"[worker {task_id}] 🚨🚨🚨 FALL DETECTED! {event_label} 🚨🚨🚨 | agent='{agent_name}' | video_time={video_ts}")
-                        print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 60}")
-                        if event.get("fallen_count"):
-                            print(f"[worker {task_id}]    └─ {event.get('fallen_count')} person(s) detected as fallen")
-                    else:
-                        print(f"[worker {task_id}] 🔔 {event_label} | agent='{agent_name}' | video_time={video_ts}")
-                else:
-                    print(f"[worker {task_id}] ℹ️ No rule match | agent='{agent_name}' | video_time={video_ts}")
+                if events:
+                    for event in events:
+                        if event and event.get("label"):
+                            event_label = str(event["label"]).strip()
+                            # Make weapon detection alerts more prominent
+                            # if any(keyword in event_label.lower() for keyword in ["gun detected", "knife detected", "weapon detected"]):
+                            #     weapon_label = event_label.upper()
+                            #     print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 20} WEAPON DETECTED {'=' * 20}")
+                            #     print(f"[worker {task_id}] 🚨🚨🚨 {weapon_label} 🚨🚨🚨 | agent='{agent_name}' | video_time={video_ts}")
+                            #     print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 60}")
+                            # # Make fall detection alerts more prominent
+                            # elif "fall" in event_label.lower() or "accident" in event_label.lower():
+                            #     print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 20} FALL DETECTED {'=' * 20}")
+                            #     print(f"[worker {task_id}] 🚨🚨🚨 FALL DETECTED! {event_label} 🚨🚨🚨 | agent='{agent_name}' | video_time={video_ts}")
+                            #     print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 60}")
+                            #     if event.get("fallen_count"):
+                            #         print(f"[worker {task_id}]    └─ {event.get('fallen_count')} person(s) detected as fallen")
+                            if event_label:
+                                print(f"[worker {task_id}] 🔔 {event_label} | agent='{agent_name}' | video_time={video_ts}")
+                            else:
+                                print(f"[worker {task_id}] ℹ️ No alert | agent='{agent_name}' | video_time={video_ts}")
 
                 # Heartbeat
                 tasks_collection.update_one({"_id": ObjectId(task_id)}, {"$set": {"updated_at": iso_now()}})
@@ -591,8 +600,8 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                             model_id = model_ids[model_idx] if model_idx < len(model_ids) else ""
                             
                             # Use unified extraction (handles all model types)
-                            normalize = "weapon" in model_id.lower()
-                            model_detections = extract_all_detections(first_result, model_id=model_id, normalize_classes=normalize)
+                            # Rules handle class normalization internally if needed
+                            model_detections = extract_all_detections(first_result, model_id=model_id)
                             print("model_detections: ", model_detections)
                             # Merge into combined detections
                             merged_boxes.extend(model_detections.get("boxes", []))
@@ -627,6 +636,7 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                             
                             # Extract target classes from rules (generic - works for any class)
                             target_classes = extract_target_classes_from_rules(loaded_rules)
+                            print(f"[worker {task_id}] 🔍 target_classes extracted from rules: {target_classes}")
                             
                             # Get objects currently in zone (BEFORE filtering) for enter/exit tracking
                             current_objects_in_zone = get_objects_in_zone(
@@ -672,6 +682,8 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                             
                             # Count detections before filtering
                             detections_before = len(detections.get("classes", []))
+                            detections_before_classes = detections.get("classes", [])
+                            print(f"[worker {task_id}] 🔍 Detections BEFORE zone filtering: {detections_before} objects, classes: {detections_before_classes}")
                             
                             # Filter detections to only include objects inside the zone
                             # Only filter for classes specified in rules (generic approach)
@@ -685,6 +697,8 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                             
                             # Count detections after filtering
                             detections_after = len(detections.get("classes", []))
+                            detections_after_classes = detections.get("classes", [])
+                            print(f"[worker {task_id}] 🔍 Detections AFTER zone filtering: {detections_after} objects, classes: {detections_after_classes}")
                             
                             # If any objects were detected in the restricted zone, log it
                             if detections_after > 0:
@@ -720,30 +734,32 @@ def run_task_worker(task_id: str, shared_store: Optional["Dict[str, Any]"] = Non
                         except Exception as exc:  # noqa: BLE001
                             print(f"[worker {task_id}] ⚠️  Error processing frame for stream (patrol): {exc}")
 
-                    event = None
+                    events = None
                     if loaded_rules:
                         print(f"[worker {task_id}] ⏱️ Evaluating rules: {loaded_rules}")
                         for rule in loaded_rules:
                             print(f"[worker {task_id}] ⏱️ Rule: {rule}")
-                        event = evaluate_rules(loaded_rules, detections, task, rule_state, detections["ts"])
-                        print(f"[worker {task_id}] ⏱️ Event: {event}")
+                        events = evaluate_rules(loaded_rules, detections, task, rule_state, detections["ts"])
+                        print(f"[worker {task_id}] ⏱️ Events: {events}")
                     else:
                         label = check_event_match(task, merged_classes)
-                        event = {"label": label} if label else None
+                        events = [{"label": label}] if label else None
 
                     video_ms = get_video_time_ms(video_capture, frame_index, fps) if not use_hub else (frame_index / float(max(1, fps))) * 1000.0
                     video_ts = format_video_time_ms(video_ms)
 
-                    if event and event.get("label"):
-                        event_label = str(event["label"]).strip()
-                        # Make weapon detection alerts more prominent
-                        if any(keyword in event_label.lower() for keyword in ["gun detected", "knife detected", "weapon detected"]):
-                            weapon_label = event_label.upper()
-                            print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 20} WEAPON DETECTED {'=' * 20}")
-                            print(f"[worker {task_id}] 🚨🚨🚨 {weapon_label} 🚨🚨🚨 | agent='{agent_name}' | video_time={video_ts}")
-                            print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 60}")
-                        else:
-                            print(f"[worker {task_id}] 🔔 {event_label} | agent='{agent_name}' | video_time={video_ts}")
+                    if events:
+                        for event in events:
+                            if event and event.get("label"):
+                                event_label = str(event["label"]).strip()
+                                # Make weapon detection alerts more prominent
+                                if any(keyword in event_label.lower() for keyword in ["gun detected", "knife detected", "weapon detected"]):
+                                    weapon_label = event_label.upper()
+                                    print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 20} WEAPON DETECTED {'=' * 20}")
+                                    print(f"[worker {task_id}] 🚨🚨🚨 {weapon_label} 🚨🚨🚨 | agent='{agent_name}' | video_time={video_ts}")
+                                    print(f"[worker {task_id}] 🚨🚨🚨 {'=' * 60}")
+                                else:
+                                    print(f"[worker {task_id}] 🔔 {event_label} | agent='{agent_name}' | video_time={video_ts}")
                     else:
                         print(f"[worker {task_id}] ℹ️ No rule match | agent='{agent_name}' | video_time={video_ts}")
 

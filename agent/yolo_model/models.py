@@ -18,9 +18,9 @@ def register_model(name: str) -> Callable[[ModelLoader], ModelLoader]:
     Register a model loader under a simple name.
 
     Example:
-        @register_model("yolov8n")
-        def load_v8n(_name: str):
-            return YOLO("yolov8n.pt")
+        @register_model("yolov8m")
+        def load_v8m(_name: str):
+            return YOLO("yolov8m.pt")
     """
     def decorator(func: ModelLoader) -> ModelLoader:
         _MODEL_REGISTRY[name.lower()] = func
@@ -30,12 +30,19 @@ def register_model(name: str) -> Callable[[ModelLoader], ModelLoader]:
 
 
 
+####################################################################
+#        Object Detection Models (yolov8m.pt)
+####################################################################
+
 @register_model("yolov8m.pt")
 def _yolov8m_loader(_name: str) -> Optional[Model]:
     if YOLO is None:
         print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
         return None
     return YOLO("yolov8m.pt")
+####################################################################
+#        Segmentation Models (yolov8m-seg.pt)
+####################################################################
 
 @register_model("yolov8m-seg.pt")
 def _yolov8m_seg_loader(_name: str) -> Optional[Model]:
@@ -45,36 +52,20 @@ def _yolov8m_seg_loader(_name: str) -> Optional[Model]:
     print("==================================================Loading yolov8m-seg.pt==================================================")    
     return YOLO("yolov8m-seg.pt")    
 
+####################################################################
+#        Pose Detection Models (yolov8m-pose.pt)
+####################################################################
 
-@register_model("yolov8n.pt")
-def _yolov8n_loader(_name: str) -> Optional[Model]:
+@register_model("yolov8m-pose.pt")
+def _yolov8m_pose_loader(_name: str) -> Optional[Model]:
     if YOLO is None:
         print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
         return None
-    return YOLO("yolov8n.pt")
+    return YOLO("yolov8m-pose.pt")  
 
-
-@register_model("yolov8s.pt")
-def _yolov8s_loader(_name: str) -> Optional[Model]:
-    if YOLO is None:
-        print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
-        return None
-    return YOLO("yolov8s.pt")
-
-@register_model("yolov8n-pose.pt")
-def _yolov8n_pose_loader(_name: str) -> Optional[Model]:
-    if YOLO is None:
-        print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
-        return None
-    return YOLO("yolov8n-pose.pt")  
-
-
-@register_model("yolov8s-pose.pt")
-def _yolov8s_pose_loader(_name: str) -> Optional[Model]:
-    if YOLO is None:
-        print("⚠️ YOLO not available (ultralytics not installed). Skipping detection.")
-        return None
-    return YOLO("yolov8s-pose.pt")     
+####################################################################
+#        Weapon Detection Models (Epoch 150)
+####################################################################
 
 @register_model("epoch150.pt")
 def _yolov8_weapon_detection_1(_name: str) -> Optional[Model]:

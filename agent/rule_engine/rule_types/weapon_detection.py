@@ -33,13 +33,17 @@ def evaluate_weapon_detection(rule: Dict[str, Any], detections: Dict[str, Any], 
     - Supports optional min_count to require multiple detections.
     """
     detected_classes = [str(c).lower() for c in (detections.get("classes") or [])]
+    print(f"[weapon_detection] detected_classes: {detected_classes}")
     if not detected_classes:
+        print(f"[weapon_detection] No detected classes, returning None")
         rule_state["last_matched_since"] = None
         return None
     
     # Get weapon class from rule
     rule_class = str(rule.get("class") or "").strip().lower()
+    print(f"[weapon_detection] rule_class: '{rule_class}'")
     if not rule_class:
+        print(f"[weapon_detection] No rule_class specified, returning None")
         rule_state["last_matched_since"] = None
         return None
     
@@ -68,6 +72,8 @@ def evaluate_weapon_detection(rule: Dict[str, Any], detections: Dict[str, Any], 
         # If no match found, use rule_class directly (fallback)
         if not target_weapon_classes:
             target_weapon_classes = [rule_class]
+    
+    print(f"[weapon_detection] target_weapon_classes: {target_weapon_classes}")
     
     # Count occurrences of ONLY the specified weapon type in detections
     # Use precise matching to avoid cross-contamination between gun and knife
@@ -100,16 +106,21 @@ def evaluate_weapon_detection(rule: Dict[str, Any], detections: Dict[str, Any], 
             weapon_count += 1
             matched_detected_classes.append(detected_class)
     
+    print(f"[weapon_detection] weapon_count: {weapon_count}, matched_detected_classes: {matched_detected_classes}")
+    
     if weapon_count == 0:
+        print(f"[weapon_detection] No weapons found (weapon_count=0), returning None")
         rule_state["last_matched_since"] = None
         return None
     
     # Check min_count if specified
     min_count = rule.get("min_count")
+    print(f"[weapon_detection] min_count: {min_count}")
     if min_count is not None and min_count != "null":
         try:
             min_count_int = int(min_count)
             if weapon_count < min_count_int:
+                print(f"[weapon_detection] weapon_count ({weapon_count}) < min_count ({min_count_int}), returning None")
                 rule_state["last_matched_since"] = None
                 return None
         except (ValueError, TypeError):
@@ -127,9 +138,11 @@ def evaluate_weapon_detection(rule: Dict[str, Any], detections: Dict[str, Any], 
     # Update rule state
     rule_state["last_matched_since"] = now
     
-    return {
+    result = {
         "label": label,
         "matched_classes": list(set(matched_detected_classes)) if matched_detected_classes else [rule_class],
         "weapon_count": weapon_count
     }
+    print(f"[weapon_detection] ✅ Match found! Returning: {result}")
+    return result
 

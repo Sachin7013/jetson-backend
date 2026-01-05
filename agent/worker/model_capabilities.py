@@ -17,12 +17,12 @@ from typing import Dict, Any, List, Optional, Set
 
 def detect_model_capabilities(model, model_id: str) -> Dict[str, Any]:
     """
-    Detect what a model can do by examining its structure and name.
+    Detect what a model can do by examining its structure and classes.
     
-    This is a simple, fast check that doesn't require running inference.
+    This is a generic check that inspects the model itself, not hard-coded filenames.
     We look at:
-    - Model name/ID (e.g., "pose" in name = pose detection)
-    - Model attributes (e.g., has keypoints support)
+    - Model structure (e.g., has keypoints/masks support)
+    - Model class names (e.g., detects weapons, persons, etc.)
     
     Args:
         model: The YOLO model object
@@ -39,49 +39,114 @@ def detect_model_capabilities(model, model_id: str) -> Dict[str, Any]:
             "likely_classes": List[str] # Common classes this model detects
         }
     """
-    model_id_lower = str(model_id).lower()
-    
     # Initialize capabilities
     capabilities = {
         "model_id": model_id,
         "has_boxes": True,  # All YOLO models have boxes
         "has_keypoints": False,
+        "has_weapons": False,
         "detection_type": "object", 
-        "has_masks": False, # Can detect objects with masks
+        "has_masks": False,
         "likely_classes": []
     }
     
-    # Check if it's a segmentation model FIRST (before pose check)
-    # Segmentation models can have "seg" in name but might also have "pose" in structure
-    if "seg" in model_id_lower or "segment" in model_id_lower:
-        capabilities["has_masks"] = True
-        capabilities["detection_type"] = "object"
-        capabilities["likely_classes"] = ["person"]
-        # Segmentation models don't have keypoints, so don't check for pose
-    
-    # Check if it's a pose model (by name)
-    elif "pose" in model_id_lower:
-        capabilities["has_keypoints"] = True
-        capabilities["detection_type"] = "pose"
-        capabilities["likely_classes"] = ["person"]
-    
-    # Check if it's a weapon detection model
-    elif "weapon" in model_id_lower or "gun" in model_id_lower or "knife" in model_id_lower:
-        capabilities["detection_type"] = "weapon"
-        capabilities["likely_classes"] = ["gun", "knife", "weapon"]
-    
-    # Try to inspect model structure (if possible) - but only if not already detected as segmentation
-    if not capabilities["has_masks"]:
+    # Inspect model structure to detect capabilities
+    try:
+        # Get model class names (what it can detect)
+        class_names = {}
+        if hasattr(model, "names") and model.names:
+            class_names = model.names
+        elif hasattr(model, "model") and hasattr(model.model, "names") and model.model.names:
+            class_names = model.model.names
+        
+        # Convert to list of class name strings (keep original, don't normalize here)
+        class_list = []
+        if isinstance(class_names, dict):
+            class_list = [str(name) for name in class_names.values()]
+        elif isinstance(class_names, list):
+            class_list = [str(name) for name in class_names]
+        
+        # Store original class names (normalization happens later in extract_all_detections if needed)
+        capabilities["likely_classes"] = class_list
+        
+        # Check for segmentation/mask support FIRST (before other checks)
+        # This is important because segmentation models should be detected as segmentation
+        # even if they have "pose" or other keywords in their structure
+        has_mask_support = False
         try:
-            # Check if model has keypoint-related attributes
-            if hasattr(model, "model"):
-                model_structure = str(model.model)
-                if "keypoint" in model_structure.lower() or "pose" in model_structure.lower():
-                    capabilities["has_keypoints"] = True
-                    capabilities["detection_type"] = "pose"
+            # First, check if model has a task attribute (YOLO models often have this)
+            if hasattr(model, "task"):
+                task = str(model.task).lower()
+                if task == "segment" or "seg" in task:
+                    has_mask_support = True
+            # Also check model structure as fallback
+            if not has_mask_support and hasattr(model, "model"):
+                model_str = str(model.model).lower()
+                # Check for segmentation-related layers
+                if "seg" in model_str or "segment" in model_str or "mask" in model_str:
+                    has_mask_support = True
         except Exception:  # noqa: BLE001
-            # If inspection fails, rely on name-based detection
             pass
+        
+        # Check for pose/keypoint support by inspecting model structure
+        # Only check if not already detected as segmentation
+        has_keypoint_support = False
+        if not has_mask_support:
+            try:
+                # First, check if model has a task attribute
+                if hasattr(model, "task"):
+                    task = str(model.task).lower()
+                    if task == "pose" or "pose" in task:
+                        has_keypoint_support = True
+                # Also check model structure as fallback
+                if not has_keypoint_support and hasattr(model, "model"):
+                    model_str = str(model.model).lower()
+                    # Check for keypoint-related layers/attributes
+                    if "keypoint" in model_str or "pose" in model_str:
+                        has_keypoint_support = True
+            except Exception:  # noqa: BLE001
+                pass
+        
+        # Detect weapon model by checking if it detects weapon-related classes
+        # Only check if not already detected as segmentation or pose
+        # Use strict matching (exact match or word boundaries) to avoid false positives
+        has_weapon_classes = False
+        if not has_mask_support and not has_keypoint_support:
+            weapon_keywords = ["gun", "knife", "weapon", "pistol", "rifle", "blade"]
+            # Normalize class names only for comparison (temporary, not stored)
+            class_list_lower = [cls.lower().strip() for cls in class_list]
+            # Check for exact matches or word boundaries (not just substring)
+            for cls_lower in class_list_lower:
+                for keyword in weapon_keywords:
+                    keyword_lower = keyword.lower()
+                    # Exact match or word boundary match
+                    if cls_lower == keyword_lower or \
+                       cls_lower.startswith(keyword_lower + " ") or \
+                       cls_lower.endswith(" " + keyword_lower) or \
+                       (" " + keyword_lower + " ") in (" " + cls_lower + " "):
+                        has_weapon_classes = True
+                        break
+                if has_weapon_classes:
+                    break
+        
+        # Determine detection type based on capabilities
+        # Priority: segmentation > weapon > pose > object
+        if has_mask_support:
+            capabilities["detection_type"] = "object"
+            capabilities["has_masks"] = True
+        elif has_weapon_classes:
+            capabilities["detection_type"] = "weapon"
+            capabilities["has_weapons"] = True
+        elif has_keypoint_support:
+            capabilities["detection_type"] = "pose"
+            capabilities["has_keypoints"] = True
+        else:
+            capabilities["detection_type"] = "object"
+            
+    except Exception:  # noqa: BLE001
+        # If inspection fails, default to generic object detection
+        # This is a fallback - model will still work but may not be optimized
+        pass
     
     return capabilities
 
@@ -91,67 +156,86 @@ def get_models_needed_by_rules(
     available_models: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """
-    Determine which models are needed based on the active rules.
+    OPTIMIZATION: Only return models that are actually needed by the rules.
     
-    This helps optimize performance by only processing models that are actually needed.
+    Purpose: Instead of running ALL models on every frame, we only run the models
+    that are required by the active rules. This saves computation time.
+    
+    Example:
+    - If rules need weapon detection → only use weapon models
+    - If rules need pose detection → only use pose models  
+    - If rules need masks → only use segmentation models
+    - If no specific needs → use all models
     
     Args:
-        rules: List of rule dictionaries from the task
-        available_models: List of model capability dictionaries
+        rules: List of rule dictionaries from the task (e.g., [{"type": "weapon_detection"}, ...])
+        available_models: List of all loaded model capabilities
     
     Returns:
-        List of model capabilities that should be used
+        List of model capabilities that match the rules (or all models if no match)
     """
+    # If no rules, use all models
     if not rules:
-        # If no rules, use all models (backward compatibility)
         return available_models
     
-    # Analyze rules to determine what we need
-    needs_pose = False
-    needs_weapons = False
-    needs_objects = False
-    needs_masks = False
+    # Step 1: Figure out what capabilities the rules need
+    required_capabilities = {
+        "weapon": False,  # Need weapon detection model?
+        "pose": False,    # Need pose/keypoint model?
+        "masks": False,   # Need segmentation model?
+        "object": False  # Need regular object detection?
+    }
+    
     for rule in rules:
         rule_type = str(rule.get("type", "")).lower()
         
-        # Check rule types that need specific model capabilities
-        if rule_type in ["accident_presence", "fall_detection"]:
-            needs_pose = True
-            needs_objects = True
-        
+        # Map rule types to required capabilities
         if rule_type == "weapon_detection":
-            needs_weapons = True
-            needs_objects = True
+            required_capabilities["weapon"] = True
+            required_capabilities["object"] = True
         
-        # Most rules need object detection
-        if rule_type in ["class_presence", "class_count", "count_at_least"]:
-            needs_objects = True
-            needs_masks = True
-    
-    # Filter models based on needs
-    selected_models = []
-    
-    for model_cap in available_models:
-        model_type = model_cap.get("detection_type", "object")
-        has_masks = model_cap.get("has_masks", False)
+        elif rule_type in ["accident_presence", "fall_detection"]:
+            required_capabilities["pose"] = True
+            required_capabilities["object"] = True
         
-        # Select models that match our needs
-        if needs_weapons and model_type == "weapon":
-            selected_models.append(model_cap)
-        elif needs_pose and model_type == "pose":
-            selected_models.append(model_cap)
-        elif needs_masks and has_masks:
-            # If masks are needed, include models with mask capability
-            selected_models.append(model_cap)
-        elif needs_objects and model_type == "object":
-            selected_models.append(model_cap)
-        elif not (needs_weapons or needs_pose or needs_masks):
-            # If no specific needs, use all models
-            selected_models.append(model_cap)
+        elif rule_type in ["class_presence", "class_count", "count_at_least"]:
+            required_capabilities["masks"] = True
+            required_capabilities["object"] = True
     
-    # If no models selected, use all (safety fallback)
-    if not selected_models:
+    # Step 2: If no specific requirements, use all models
+    has_specific_requirements = any([
+        required_capabilities["weapon"],
+        required_capabilities["pose"],
+        required_capabilities["masks"]
+    ])
+    
+    if not has_specific_requirements:
         return available_models
     
-    return selected_models
-
+    # Step 3: Filter models to only those that match requirements
+    matching_models = []
+    
+    for model in available_models:
+        model_type = model.get("detection_type", "object")
+        model_has_masks = model.get("has_masks", False)
+        
+        # Check if this model matches any requirement
+        is_needed = False
+        
+        if required_capabilities["weapon"] and model_type == "weapon":
+            is_needed = True
+        elif required_capabilities["pose"] and model_type == "pose":
+            is_needed = True
+        elif required_capabilities["masks"] and model_has_masks:
+            is_needed = True
+        elif required_capabilities["object"] and model_type == "object":
+            is_needed = True
+        
+        if is_needed:
+            matching_models.append(model)
+    
+    # Step 4: Safety fallback - if no matches, use all models
+    if not matching_models:
+        return available_models
+    
+    return matching_models
